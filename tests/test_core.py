@@ -745,7 +745,8 @@ def test_canceled_buyer_vs_system_classification_and_import():
                  {"item_name": "Sarung", "model_name": "Putih", "model_quantity_purchased": 2},
              ],
          }]), \
-         mock.patch.object(c, "tracking_number", return_value=""):
+         mock.patch.object(c, "tracking_number", return_value=""), \
+         mock.patch.object(c, "escrow_detail", return_value={}):
         synced = c.sync(7)
     assert len(synced) == 1
     assert synced[0]["resi"] == "ORDER-SN_CANC"
@@ -1043,7 +1044,8 @@ def test_payment_method_totals_fee_breakdown_and_inspector():
              "package_list": [{}],
              "item_list": [{"item_name": "Sarung", "model_name": "Hitam", "model_quantity_purchased": 1, "model_discounted_price": 95000}],
          }]), \
-         mock.patch.object(c, "tracking_number", return_value="SPXID06999111000B"):
+         mock.patch.object(c, "tracking_number", return_value="SPXID06999111000B"), \
+         mock.patch.object(c, "escrow_detail", return_value={}):
         synced = c.sync(7)
     assert synced[0]["payment_method"] == "COD (Bayar di Tempat)"
     assert synced[0]["total_payment"] == 95000
@@ -1118,7 +1120,8 @@ def test_menunggu_pickup_and_lainnya_category():
              "package_list": [{}],
              "item_list": [{"item_name": "Sarung", "model_name": "Hitam", "model_quantity_purchased": 1}],
          }]), \
-         mock.patch.object(c, "tracking_number", return_value=""):
+         mock.patch.object(c, "tracking_number", return_value=""), \
+         mock.patch.object(c, "escrow_detail", return_value={}):
         synced = c.sync(7)
     assert len(synced) == 1 and synced[0]["resi"] == "ORDER-SN_WAIT"
 
@@ -1345,6 +1348,991 @@ def test_workspace_checklist_filter_and_non_scroll_sidebar():
     finally:
         cfg.DB_PATH, cfg.SETTINGS_PATH = old_cfg_db, old_cfg_set
         mw_mod.load_settings, mw_mod.save_settings = old_load, old_save
+
+
+def test_anteraja_dropoff_not_delivered_and_out_for_delivery():
+    import json
+    from resitrack.db import DB
+    from resitrack.models import ST_OUT, classify
+
+    drop_evs = [
+        TrackEvent("2026-11-27 14:16", "Paket sudah diterima di drop point Mitra AnterAja.", ""),
+        TrackEvent("2026-11-27 14:15", "Tugas pickup sudah diambil alih oleh SATRIA dan paket akan segera pickup.", ""),
+    ]
+    assert classify(drop_evs[0].description) == ST_TRANSIT
+    assert resolve_overall_status("Sedang Dikirim", "", drop_evs) == ST_TRANSIT
+    # Even if an upstream aggregator wrongly flagged delivered, facility receipt guard protects it
+    assert resolve_overall_status("Sedang Dikirim", ST_DELIVERED, drop_evs) == ST_TRANSIT
+
+    for facility_txt in (
+        "Paket telah diterima di gudang sortir Pekalongan",
+        "Paket diterima oleh agen SPX Express",
+        "Received at sorting hub Jakarta",
+        "Paket diterima di counter JNE",
+    ):
+        assert classify(facility_txt) == ST_TRANSIT, f"False delivered on {facility_txt!r}"
+
+    # Genuine buyer deliveries (including SPX with Hub in location field) stay ST_DELIVERED
+    spx_delv = [TrackEvent("2026-11-25 09:57", "Pesanan tiba di alamat tujuan. diterima di Atas rak sepatu.", "Mapanget Hub")]
+    assert resolve_overall_status("Telah Dikirim", ST_DELIVERED, spx_delv) == ST_DELIVERED
+    ant_delv = [TrackEvent("2026-11-27 09:03", "Delivery sukses oleh SATRIA dan paket telah diterima oleh arly(Penerima Asli ).", "")]
+    assert resolve_overall_status("Telah Dikirim", ST_DELIVERED, ant_delv) == ST_DELIVERED
+    assert resolve_overall_status("Telah Dikirim", "", [TrackEvent("2026-11-27 10:00", "Paket diterima oleh Siti (Keluarga)", "")]) == ST_DELIVERED
+
+    # Anteraja out for delivery -> ST_OUT
+    satria_out = [TrackEvent("2026-11-27 10:00", "SATRIA sudah ditugaskan dan paket akan segera diantar ke penerima.", "")]
+    assert resolve_overall_status("Sedang Dikirim", "", satria_out) == ST_OUT
+
+    # DB._migrate heals pre-existing false ST_DELIVERED drop-point row & ST_TRANSIT out-for-delivery row
+    tmp_db = os.path.join(tempfile.mkdtemp(), "dropoff_heal.db")
+    db = DB(tmp_db)
+    db.conn.execute(
+        "INSERT INTO shipments (resi, courier, order_sn, status, order_status, last_event, events_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("11004737246544", "ANTERAJA", "SN_DROP", ST_DELIVERED, "Sedang Dikirim", drop_evs[0].description, json.dumps([e.__dict__ for e in drop_evs])),
+    )
+    db.conn.execute(
+        "INSERT INTO shipments (resi, courier, order_sn, status, order_status, last_event, events_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("11004720644465", "ANTERAJA", "SN_SATRIA", ST_TRANSIT, "Sedang Dikirim", satria_out[0].description, json.dumps([e.__dict__ for e in satria_out])),
+    )
+    db.conn.execute(
+        "INSERT INTO shipments (resi, courier, order_sn, status, order_status, last_event, events_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("SPX_GEN_DELV", "SPX", "SN_SPX_D", ST_DELIVERED, "Telah Dikirim", spx_delv[0].description, json.dumps([e.__dict__ for e in spx_delv])),
+    )
+    db.conn.commit()
+    db._migrate()
+    assert db.get("11004737246544")["status"] == ST_TRANSIT
+    assert db.get("11004720644465")["status"] == ST_OUT
+    assert db.get("SPX_GEN_DELV")["status"] == ST_DELIVERED
+    db.close()
+
+
+def test_clickable_duplicate_badge_popover_and_group_filter():
+    from PySide6.QtCore import QPoint, QRect
+    from PySide6.QtWidgets import QApplication
+    import resitrack.config as cfg
+    import resitrack.db as db_mod
+    import resitrack.main_window as mw_mod
+
+    tmp = Path(tempfile.mkdtemp())
+    db_path = tmp / "dup_popover.db"
+    old_cfg_db, old_cfg_set = cfg.DB_PATH, cfg.SETTINGS_PATH
+    old_load, old_save = mw_mod.load_settings, mw_mod.save_settings
+    try:
+        cfg.DB_PATH = db_path
+        cfg.SETTINGS_PATH = tmp / "settings.json"
+        mw_mod.load_settings = lambda: dict(cfg.DEFAULTS)
+        mw_mod.save_settings = lambda s: None
+
+        db = db_mod.DB(db_path)
+        db.upsert({
+            "resi": "SPX_G1", "courier": "SPX", "order_sn": "SN_G1", "buyer_username": "buyer_1",
+            "recipient_name": "R****a", "recipient_phone": "******88", "city": "KOTA SEMARANG",
+            "order_status": "Sedang Dikirim", "total_payment": 110000,
+        })
+        db.upsert({
+            "resi": "SPX_G2", "courier": "SPX", "order_sn": "SN_G2", "buyer_username": "buyer_2",
+            "recipient_name": "R****a", "recipient_phone": "******88", "city": "KOTA SEMARANG",
+            "order_status": "Selesai", "total_payment": 125000,
+        })
+        db.upsert({
+            "resi": "SPX_G3", "courier": "SPX", "order_sn": "SN_G3", "buyer_username": "buyer_3",
+            "recipient_name": "R****a", "recipient_phone": "******88", "city": "KOTA SEMARANG",
+            "order_status": "Batal", "cancel_by": "system",
+        })
+        db.upsert({
+            "resi": "SPX_SOLO", "courier": "SPX", "order_sn": "SN_SOLO", "buyer_username": "solo",
+            "recipient_name": "Z****n", "recipient_phone": "******10", "city": "KOTA SOLO",
+            "order_status": "Sedang Dikirim",
+        })
+        db.close()
+
+        app = QApplication.instance() or QApplication([])
+        win = mw_mod.MainWindow(auto_sync=False)
+        win.show()
+        app.processEvents()
+
+        # Verify hit-rect helper returns non-empty rect for duplicate rows & empty for solo row
+        cell = QRect(0, 0, 166, 60)
+        dup_rect = mw_mod.StatusPillDelegate.dup_badge_rect(cell, {"_dup_count": 3}, ST_TRANSIT, win.table.font())
+        solo_rect = mw_mod.StatusPillDelegate.dup_badge_rect(cell, {"_dup_count": 0}, ST_TRANSIT, win.table.font())
+        assert not dup_rect.isEmpty() and cell.contains(dup_rect)
+        assert solo_rect.isEmpty()
+
+        # Clicking badge opens popover listing all 3x duplicates
+        win._on_duplicate_badge_clicked("SPX_G1", QPoint(300, 300))
+        app.processEvents()
+        assert win._dup_popover.isVisible()
+        assert win._dup_popover._lbl_title.text() == "Duplikat Penerima · 3x"
+        assert win._dup_popover._list_lay.count() == 3
+
+        # Clicking an order inside popover selects & focuses it cleanly
+        win._dup_popover._on_item_clicked("SPX_G2")
+        app.processEvents()
+        assert not win._dup_popover.isVisible()
+        assert [r["resi"] for r in win.selected_rows()] == ["SPX_G2"]
+
+        # Clicking "Filter di tabel" filters main table to those 3 duplicates even from Berjalan view
+        win._on_nav_clicked("berjalan", "")
+        app.processEvents()
+        win._on_duplicate_badge_clicked("SPX_G1", QPoint(300, 300))
+        app.processEvents()
+        win._dup_popover._on_filter_clicked()
+        app.processEvents()
+        assert win.proxy.rowCount() == 3
+        assert win._filter_bar.isVisible()
+
+        # Clearing dup group filter restores all 4 rows
+        win._clear_dup_group_filter()
+        app.processEvents()
+        assert win.proxy.rowCount() == 4
+        assert win._filter_bar.isHidden()
+
+        win.close()
+        app.processEvents()
+    finally:
+        cfg.DB_PATH, cfg.SETTINGS_PATH = old_cfg_db, old_cfg_set
+        mw_mod.load_settings, mw_mod.save_settings = old_load, old_save
+
+
+def test_order_date_parsing_import_backfill_and_presets():
+    from datetime import date, timedelta
+    from PySide6.QtWidgets import QApplication
+    from resitrack.db import DB
+    from resitrack.inspector import InspectorPanel
+    from resitrack.models import (
+        format_date_short,
+        infer_date_from_order_sn,
+        parse_date_str,
+        resolve_date_range,
+        row_order_date,
+    )
+
+    assert parse_date_str("2026-11-26 14:30:05") == "2026-11-26 14:30"
+    assert parse_date_str("26/11/2026") == "2026-11-26"
+    assert parse_date_str("N") == "" and parse_date_str("") == ""
+    assert infer_date_from_order_sn("261127ABC12345") == "2026-11-27"
+    assert infer_date_from_order_sn("251231XYZ999") == "2025-12-31"
+    assert infer_date_from_order_sn("999999ABC12345") == ""
+    assert infer_date_from_order_sn("SHORT") == ""
+
+    assert row_order_date({"order_date": "2026-11-20 08:15", "order_sn": "261127ABC12345"}) == date(2026, 11, 20)
+    assert row_order_date({"order_date": "", "order_sn": "261125ABC12345", "created_at": "2026-11-27"}) == date(2026, 11, 25)
+    assert format_date_short(date(2026, 11, 27)) == "27 Nov 2026"
+
+    ref = date(2026, 11, 27)  # Friday
+    assert resolve_date_range("today", today=ref) == (date(2026, 11, 27), date(2026, 11, 27))
+    assert resolve_date_range("yesterday", today=ref) == (date(2026, 11, 26), date(2026, 11, 26))
+    assert resolve_date_range("this_week", today=ref) == (date(2026, 11, 23), date(2026, 11, 27))
+    assert resolve_date_range("last_7d", today=ref) == (date(2026, 11, 21), date(2026, 11, 27))
+    assert resolve_date_range("this_month", today=ref) == (date(2026, 11, 1), date(2026, 11, 27))
+    assert resolve_date_range("last_month", today=ref) == (date(2026, 10, 1), date(2026, 10, 31))
+    assert resolve_date_range("custom", date(2026, 11, 27), date(2026, 11, 10), today=ref) == (date(2026, 11, 10), date(2026, 11, 27))
+
+    # CSV import parses Waktu Pesanan Dibuat -> order_date
+    p = os.path.join(tempfile.mkdtemp(), "dates.csv")
+    with open(p, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["No. Pesanan", "Status Pesanan", "No. Resi", "Waktu Pesanan Dibuat", "Username (Pembeli)"])
+        w.writerow(["261120TEST001", "Sedang Dikirim", "SPXID06999000111A", "2026-11-20 09:42", "buyer_dt"])
+    recs, _ = importer.parse_file(p)
+    assert recs[0]["order_date"] == "2026-11-20 09:42"
+
+    # DB._migrate backfills order_date from order_sn YYMMDD for legacy rows
+    tmp_db = os.path.join(tempfile.mkdtemp(), "date_backfill.db")
+    db = DB(tmp_db)
+    db.conn.execute(
+        "INSERT INTO shipments (resi, courier, order_sn, status, order_status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        ("SPX_BF_1", "SPX", "261018VUMMDDDD", ST_TRANSIT, "Sedang Dikirim", "2026-11-27 10:00"),
+    )
+    db.conn.commit()
+    db._migrate()
+    bf = dict(db.get("SPX_BF_1"))
+    assert bf["order_date"] == "2026-10-18"
+    db.upsert(recs[0])
+    row_imp = dict(db.get("SPXID06999000111A"))
+    assert row_imp["order_date"] == "2026-11-20 09:42"
+
+    _app = QApplication.instance() or QApplication([])
+    insp = InspectorPanel()
+    insp.set_rows([row_imp])
+    assert insp._lbl_order_date.text() == "20 Nov 2026, 09:42"
+    insp.close()
+    db.close()
+
+
+def test_simultaneous_include_exclude_and_date_filter_ui():
+    from datetime import date, timedelta
+    from PySide6.QtCore import QDate
+    from PySide6.QtWidgets import QApplication
+    import resitrack.config as cfg
+    import resitrack.db as db_mod
+    import resitrack.main_window as mw_mod
+    from resitrack.models import (
+        CAT_FINISHED,
+        ST_CANCELED_BUYER,
+        ST_CANCELED_SYSTEM,
+        ST_COMPLETED,
+    )
+
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+    week_start = today - timedelta(days=today.weekday())
+    last_month_day = today.replace(day=1) - timedelta(days=2)
+
+    tmp = Path(tempfile.mkdtemp())
+    db_path = tmp / "dual_date.db"
+    old_cfg_db, old_cfg_set = cfg.DB_PATH, cfg.SETTINGS_PATH
+    old_load, old_save = mw_mod.load_settings, mw_mod.save_settings
+    try:
+        cfg.DB_PATH = db_path
+        cfg.SETTINGS_PATH = tmp / "settings.json"
+        mw_mod.load_settings = lambda: dict(cfg.DEFAULTS)
+        mw_mod.save_settings = lambda s: None
+
+        db = db_mod.DB(db_path)
+        db.upsert({
+            "resi": "SPX_TODAY_COD_DONE", "courier": "SPX", "order_sn": "SN1", "buyer_username": "b1",
+            "order_status": "Selesai", "payment_method": "COD (Bayar di Tempat)",
+            "order_date": today.strftime("%Y-%m-%d 10:00"),
+        })
+        db.upsert({
+            "resi": "SPX_YEST_QRIS_DONE", "courier": "SPX", "order_sn": "SN2", "buyer_username": "b2",
+            "order_status": "Selesai", "payment_method": "QRIS",
+            "order_date": yesterday.strftime("%Y-%m-%d 11:00"),
+        })
+        db.upsert({
+            "resi": "JNE_WK_COD_DONE", "courier": "JNE", "order_sn": "SN3", "buyer_username": "b3",
+            "order_status": "Selesai", "payment_method": "COD (Bayar di Tempat)",
+            "order_date": week_start.strftime("%Y-%m-%d 09:00"),
+        })
+        db.upsert({
+            "resi": "SPX_LM_CANC_SYS", "courier": "SPX", "order_sn": "SN4", "buyer_username": "b4",
+            "order_status": "Batal", "cancel_by": "system", "payment_method": "COD (Bayar di Tempat)",
+            "order_date": last_month_day.strftime("%Y-%m-%d 15:00"),
+        })
+        db.upsert({
+            "resi": "SPX_TODAY_CANC_BUY", "courier": "SPX", "order_sn": "SN5", "buyer_username": "b5",
+            "order_status": "Batal", "cancel_by": "buyer", "payment_method": "COD (Bayar di Tempat)",
+            "order_date": today.strftime("%Y-%m-%d 08:00"),
+        })
+        db.close()
+
+        app = QApplication.instance() or QApplication([])
+        win = mw_mod.MainWindow(auto_sync=False)
+        win.show()
+        app.processEvents()
+
+        # 1. Verify minimalist compact size, toggle close on Filter click, and tri-state cycling
+        import time as _time
+        pop = win._filter_popover
+        assert pop.width() <= 360 and pop.sizeHint().height() <= 400
+        assert pop._tabs_stack.count() == 3
+
+        assert not pop.isVisible()
+        win._open_filter_popover()
+        app.processEvents()
+        assert pop.isVisible()
+        # Clicking Filter while open closes it
+        win._open_filter_popover()
+        app.processEvents()
+        assert not pop.isVisible()
+        # Simulate Qt.Popup auto-dismiss when clicking the Filter button -> must stay closed on release
+        pop.show()
+        pop.hide()
+        pop._closed_by_anchor = True
+        pop._closed_at = _time.monotonic()
+        win._open_filter_popover()
+        app.processEvents()
+        assert not pop.isVisible()
+        # Next click opens it normally again
+        win._open_filter_popover()
+        app.processEvents()
+        assert pop.isVisible()
+        pop.hide()
+
+        spx_chip = pop._courier_checks["SPX"]
+        assert spx_chip.filter_mode == ""
+        spx_chip.click()
+        assert spx_chip.filter_mode == "include" and spx_chip.text() == "✓ SPX"
+        spx_chip.click()
+        assert spx_chip.filter_mode == "exclude" and spx_chip.text() == "✕ SPX"
+        spx_chip.click()
+        assert spx_chip.filter_mode == "" and spx_chip.text() == "SPX"
+
+        # 2. Simultaneous ✓ Tampilkan (Kategori=Selesai, Kurir=SPX) + ✕ Kecualikan (Canceled, QRIS)
+        pop._set_tab(2)  # Lainnya
+        pop._lc_checks[CAT_FINISHED].click()       # 1x -> include
+        pop._courier_checks["SPX"].click()         # 1x -> include
+        pop._pay_checks["QRIS"].click()            # 1x -> include
+        pop._pay_checks["QRIS"].click()            # 2x -> exclude
+        pop._set_tab(0)  # Status
+        pop._btn_no_canc.setChecked(True)
+        pop.apply_no_canceled_preset()
+        app.processEvents()
+
+        # Include Selesai + Include SPX + Exclude Canceled + Exclude QRIS -> ONLY SPX_TODAY_COD_DONE
+        assert win.proxy.rowCount() == 1
+        assert win.proxy.index(0, 0).data(mw_mod.Qt.UserRole) == "SPX_TODAY_COD_DONE"
+        assert pop._tab_status.text() == "Status · 2"
+        assert pop._tab_other.text() == "Lainnya · 3"
+
+        # 3. Removing ONLY exclude payment (QRIS) keeps Include (Selesai + SPX) and Exclude Canceled active -> 2 rows!
+        pop.clear_group("payments_exc")
+        app.processEvents()
+        assert win.proxy.rowCount() == 2
+        vis_resis = {win.proxy.index(i, 0).data(mw_mod.Qt.UserRole) for i in range(win.proxy.rowCount())}
+        assert vis_resis == {"SPX_TODAY_COD_DONE", "SPX_YEST_QRIS_DONE"}
+
+        # 4. Date presets via Tanggal tab: Reset all -> Hari Ini (Today) -> 2 orders
+        pop.reset_all()
+        pop._set_tab(1)
+        pop._set_date_preset("today")
+        app.processEvents()
+        assert pop._tab_date.text() == "Tanggal · 1"
+        assert win.proxy.rowCount() == 2
+        assert {win.proxy.index(i, 0).data(mw_mod.Qt.UserRole) for i in range(2)} == {"SPX_TODAY_COD_DONE", "SPX_TODAY_CANC_BUY"}
+
+        # Bulan Lalu (Last Month) -> 1 order
+        pop._set_date_preset("last_month")
+        app.processEvents()
+        assert win.proxy.rowCount() == 1
+        assert win.proxy.index(0, 0).data(mw_mod.Qt.UserRole) == "SPX_LM_CANC_SYS"
+
+        # Custom date range [yesterday .. today] -> 3 orders (2 today + 1 yesterday)
+        pop._set_date_preset("custom")
+        assert not pop._date_range_row.isHidden()
+        pop._dt_from.setDate(QDate(yesterday.year, yesterday.month, yesterday.day))
+        pop._dt_to.setDate(QDate(today.year, today.month, today.day))
+        app.processEvents()
+        expected_custom = {"SPX_TODAY_COD_DONE", "SPX_YEST_QRIS_DONE", "SPX_TODAY_CANC_BUY"}
+        if week_start == yesterday or week_start == today:
+            expected_custom.add("JNE_WK_COD_DONE")
+        got_custom = {win.proxy.index(i, 0).data(mw_mod.Qt.UserRole) for i in range(win.proxy.rowCount())}
+        assert got_custom == expected_custom
+
+        # Clearing date restores all 5 rows
+        pop.clear_group("date")
+        app.processEvents()
+        assert win.proxy.rowCount() == 5
+
+        win.close()
+        app.processEvents()
+    finally:
+        cfg.DB_PATH, cfg.SETTINGS_PATH = old_cfg_db, old_cfg_set
+        mw_mod.load_settings, mw_mod.save_settings = old_load, old_save
+
+
+def test_shopee_realtime_incremental_sync_and_last_updated_label():
+    from PySide6.QtWidgets import QApplication
+    import resitrack.config as cfg
+    import resitrack.db as db_mod
+    import resitrack.main_window as mw_mod
+    from resitrack.dialogs import SettingsDialog
+    from resitrack.workers import ShopeeSyncWorker
+
+    # 1. DB status rank must allow SHIPPED -> TO_CONFIRM_RECEIVE -> COMPLETED
+    tmp = Path(tempfile.mkdtemp())
+    db = db_mod.DB(tmp / "rt_sync.db")
+    assert db.upsert({"resi": "SPX_RT_1", "courier": "SPX", "order_sn": "SN_RT_1", "order_status": "SHIPPED"}) == "new"
+    assert db.upsert({"resi": "SPX_RT_1", "courier": "SPX", "order_sn": "SN_RT_1", "order_status": "TO_CONFIRM_RECEIVE"}) == "updated"
+    assert db.get("SPX_RT_1")["order_status"] == "TO_CONFIRM_RECEIVE"
+    assert db.upsert({"resi": "SPX_RT_1", "courier": "SPX", "order_sn": "SN_RT_1", "order_status": "COMPLETED"}) == "updated"
+    assert db.get("SPX_RT_1")["status"] == ST_COMPLETED
+
+    # 2. ShopeeClient incremental update_time order_list & short-circuit empty sync
+    c = ShopeeClient({"shopee_partner_id": "1", "shopee_partner_key": "k", "shopee_refresh_token": "r", "shopee_shop_id": "2"})
+    calls = []
+
+    def fake_get(path, params, _retry=True):
+        calls.append((path, dict(params)))
+        if path == "/api/v2/order/get_order_list":
+            return {"order_list": [], "more": False}
+        raise AssertionError(f"Unexpected API call {path}")
+
+    with mock.patch.object(c, "get", side_effect=fake_get):
+        recs = c.sync(days=1, since_ts=1795000000, time_range_field="update_time")
+    assert recs == []
+    assert len(calls) == 1
+    assert calls[0][1]["time_range_field"] == "update_time"
+    assert calls[0][1]["time_from"] == 1795000000
+
+    # 3. ShopeeSyncWorker emits sync_completed with new/updated counts & changed_resis
+    with mock.patch.object(c, "sync", return_value=[
+        {"resi": "SPX_NEW_1", "courier": "SPX", "order_sn": "SN_NEW_1", "order_status": "SHIPPED", "buyer_username": "b_new"}
+    ]):
+        w = ShopeeSyncWorker(db, c, days=1, since_ts=1795000000, time_range_field="update_time")
+        got_sync = []
+        w.signals.sync_completed.connect(lambda n, u, rs: got_sync.append((n, u, list(rs))))
+        w.run()
+    assert got_sync == [(1, 0, ["SPX_NEW_1"])]
+    assert db.get("SPX_NEW_1") is not None
+    db.close()
+
+    # 4. MainWindow realtime timer, _lbl_last_sync header visibility & non-overlap, SettingsDialog controls
+    db_path = tmp / "mw_rt.db"
+    old_cfg_db, old_cfg_set = cfg.DB_PATH, cfg.SETTINGS_PATH
+    old_load, old_save = mw_mod.load_settings, mw_mod.save_settings
+    try:
+        cfg.DB_PATH = db_path
+        cfg.SETTINGS_PATH = tmp / "settings.json"
+        mock_settings = dict(
+            cfg.DEFAULTS,
+            shopee_partner_id="2056203",
+            shopee_partner_key="secret",
+            shopee_refresh_token="ref",
+            shopee_shop_id="1584195830",
+            shopee_auto_sync_enabled=True,
+            shopee_auto_sync_minutes=2,
+        )
+        mw_mod.load_settings = lambda: dict(mock_settings)
+        mw_mod.save_settings = lambda s: mock_settings.update(s)
+
+        app = QApplication.instance() or QApplication([])
+        win = mw_mod.MainWindow(auto_sync=False)
+        win.resize(1160, 720)
+        win.show()
+        app.processEvents()
+
+        # Simulate enabled auto-sync timer & recorded last sync
+        win._auto_sync_enabled = True
+        win._apply_timer()
+        assert win._shopee_sync_timer.isActive()
+        assert win._shopee_sync_timer.interval() == 120000
+        win._record_last_sync(shopee_synced=True)
+        app.processEvents()
+
+        assert win._lbl_last_sync.isVisible()
+        assert win._lbl_last_sync.text().startswith("Diperbarui ")
+        assert win._lbl_last_sync.geometry().right() < win.btn_import.geometry().left()
+        assert mock_settings["shopee_last_sync_at"]
+        assert mock_settings["shopee_last_sync_ts"] > 0
+
+        sd = SettingsDialog(win.settings, lambda s: win._shopee(s), win)
+        sd.show()
+        app.processEvents()
+        assert sd.shopee_auto_sync.isChecked()
+        assert sd.shopee_sync_interval.value() == 2
+        assert sd.shopee_sync_interval.height() >= 34
+        sd.close()
+
+        win._auto_sync_enabled = False
+        win._shopee_sync_timer.stop()
+        win.close()
+        app.processEvents()
+    finally:
+        cfg.DB_PATH, cfg.SETTINGS_PATH = old_cfg_db, old_cfg_set
+        mw_mod.load_settings, mw_mod.save_settings = old_load, old_save
+
+
+def test_shopee_pii_mask_no_fake_duplicates_and_escrow_enrichment():
+    import json
+    from PySide6.QtWidgets import QApplication
+    from resitrack.db import DB
+    from resitrack.inspector import InspectorPanel
+    from resitrack.models import (
+        compute_duplicate_groups,
+        duplicate_resi_map,
+        is_masked_blank,
+        payment_details_dict,
+        recipient_dup_key,
+    )
+
+    # 1. Purely masked PII ('****') must never group as duplicates, while partial Excel PII works
+    for v in ("", "-", "****", "******", "****, ****"):
+        assert is_masked_blank(v), f"Expected masked blank for {v!r}"
+    for v in ("J******r", "******50", "S******t", "KAB. BERAU"):
+        assert not is_masked_blank(v), f"Expected partial PII for {v!r}"
+
+    api_rows = [
+        {"resi": "R_API_1", "recipient_name": "****", "recipient_phone": "****", "city": "****"},
+        {"resi": "R_API_2", "recipient_name": "****", "recipient_phone": "****", "city": "****"},
+        {"resi": "R_API_3", "recipient_name": "", "recipient_phone": "", "city": ""},
+    ]
+    assert compute_duplicate_groups(api_rows) == {}
+    assert duplicate_resi_map(api_rows) == {}
+    assert recipient_dup_key(api_rows[0]) == ""
+
+    xls_rows = [
+        {"resi": "R_X1", "recipient_name": "S******t", "recipient_phone": "******51", "city": "KAB. BERAU"},
+        {"resi": "R_X2", "recipient_name": "S******t", "recipient_phone": "******51", "city": "KAB. BERAU"},
+    ]
+    assert set(duplicate_resi_map(xls_rows).keys()) == {"R_X1", "R_X2"}
+
+    # 2. DB._migrate scrubs existing '****' and upsert preserves Excel partial PII against '****' overwrites
+    db = DB(os.path.join(tempfile.mkdtemp(), "pii_scrub.db"))
+    db.conn.execute(
+        "INSERT INTO shipments (resi, courier, order_sn, buyer_username, recipient_name, recipient_phone, city, order_source, order_status, status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("SPX_MASK_1", "SPX", "SN_M1", "balqis.humaira", "****", "****", "****", "shopee_api", "SHIPPED", ST_TRANSIT),
+    )
+    db.conn.commit()
+    db._migrate()
+    r_m = dict(db.get("SPX_MASK_1"))
+    assert r_m["recipient_name"] == "" and r_m["recipient_phone"] == "" and r_m["city"] == ""
+
+    # Excel partial import enriches Shopee API row cleanly
+    assert db.upsert({
+        "resi": "SPX_MASK_1", "order_sn": "SN_M1", "recipient_name": "B****a",
+        "recipient_phone": "******11", "city": "KAB. BULUNGAN",
+        "payment_details_json": json.dumps({"product_subtotal": 124000, "shipping_est": 52700}),
+    }) == "updated"
+    # Later Shopee API sync with '****' MUST NOT overwrite Excel partial PII, while merging escrow JSON!
+    db.upsert({
+        "resi": "SPX_MASK_1", "order_sn": "SN_M1", "order_source": "shopee_api",
+        "recipient_name": "****", "recipient_phone": "****", "city": "****",
+        "payment_details_json": json.dumps({"seller_voucher": 7000, "seller_fees": 10318, "escrow_amount": 106682}),
+    })
+    r_after = dict(db.get("SPX_MASK_1"))
+    assert r_after["recipient_name"] == "B****a"
+    assert r_after["recipient_phone"] == "******11"
+    assert r_after["city"] == "KAB. BULUNGAN"
+    pd_merged = payment_details_dict(r_after)
+    assert pd_merged["product_subtotal"] == 124000
+    assert pd_merged["escrow_amount"] == 106682
+    assert pd_merged["seller_fees"] == 10318
+
+    # 3. ShopeeClient.sync pulls escrow_detail + message_to_seller and scrubs '****'
+    c = ShopeeClient({"shopee_partner_id": "1", "shopee_partner_key": "k", "shopee_refresh_token": "r", "shopee_shop_id": "2"})
+    escrow_payload = {
+        "buyer_payment_info": {
+            "buyer_total_amount": 119200,
+            "merchant_subtotal": 124000,
+            "buyer_service_fee": 1000,
+            "seller_voucher": -7000,
+            "shipping_fee": 0,
+        },
+        "order_income": {
+            "commission_fee": 6143,
+            "service_fee": 2340,
+            "seller_order_processing_fee": 1250,
+            "withholding_tax": 585,
+            "shopee_shipping_rebate": 52700,
+            "escrow_amount_after_adjustment": 106682,
+        },
+    }
+    with mock.patch.object(c, "order_list", return_value=["SN_ESC_1"]), \
+         mock.patch.object(c, "order_details", return_value=[{
+             "order_sn": "SN_ESC_1",
+             "order_status": "SHIPPED",
+             "cod": True,
+             "payment_method": "Cash on Delivery",
+             "total_amount": 119200,
+             "actual_shipping_fee": 52700,
+             "buyer_username": "balqis.humaira",
+             "message_to_seller": "Tolong bungkus rapi",
+             "recipient_address": {"name": "****", "phone": "****", "city": "****", "state": "****"},
+             "shipping_carrier": "SPX",
+             "package_list": [{}],
+             "item_list": [{"item_name": "Sarung", "model_name": "Hitam", "model_quantity_purchased": 1, "model_discounted_price": 124000}],
+         }]), \
+         mock.patch.object(c, "tracking_number", return_value="SPXID_ESC_1"), \
+         mock.patch.object(c, "escrow_detail", return_value=escrow_payload):
+        synced = c.sync(7)
+    assert len(synced) == 1
+    rec = synced[0]
+    assert rec["recipient_name"] == "" and rec["recipient_phone"] == "" and rec["city"] == ""
+    assert rec["note"] == "Tolong bungkus rapi"
+    pd_s = payment_details_dict(rec)
+    assert pd_s["seller_voucher"] == 7000
+    assert pd_s["service_fee"] == 1000
+    assert pd_s["shipping_discount"] == 52700
+    assert pd_s["seller_fees"] == 10318
+    assert pd_s["escrow_amount"] == 106682
+
+    _app = QApplication.instance() or QApplication([])
+    insp = InspectorPanel()
+    insp.set_rows([rec])
+    assert insp._lbl_recipient.text().startswith("Disensor Shopee API")
+    assert insp._lbl_city.text() == "Disensor Shopee API"
+    # Verify Dana Cair Penjual appears inside payment grid
+    pay_texts = [
+        insp._pay_grid.itemAt(i).widget().text()
+        for i in range(insp._pay_grid.count())
+        if insp._pay_grid.itemAt(i) and insp._pay_grid.itemAt(i).widget()
+    ]
+    assert "Dana Cair Penjual" in pay_texts and "Rp106.682" in pay_texts
+    insp.close()
+    db.close()
+
+
+def test_recipient_subtext_under_buyer_and_pii_upgrade():
+    from PySide6.QtWidgets import QApplication
+    from resitrack.db import DB
+    from resitrack.inspector import InspectorPanel
+    from resitrack.main_window import BuyerCellDelegate
+
+    assert BuyerCellDelegate.sub_text({
+        "order_sn": "2611245NTCVVA1",
+        "recipient_name": "M******o",
+        "recipient_phone": "******73",
+    }) == ("M******o (******73)", True)
+    assert BuyerCellDelegate.sub_text({
+        "order_sn": "2611245NTCVVA2",
+        "recipient_name": "Budi",
+        "recipient_phone": "08123456789",
+    }) == ("Budi (08123456789)", True)
+    assert BuyerCellDelegate.sub_text({
+        "order_sn": "2611245NTCVVA3",
+        "recipient_name": "****",
+        "recipient_phone": "****",
+    }) == ("2611245NTCVVA3", False)
+    assert BuyerCellDelegate.sub_text({
+        "order_sn": "2611245NTCVVA4",
+        "recipient_name": "",
+        "recipient_phone": "",
+    }) == ("2611245NTCVVA4", False)
+
+    _app = QApplication.instance() or QApplication([])
+    insp = InspectorPanel()
+    insp.set_rows([{
+        "resi": "SPX123",
+        "courier": "SPX",
+        "order_sn": "2611245NTCVVA1",
+        "buyer_username": "naanndaaaa",
+        "recipient_name": "M******o",
+        "recipient_phone": "******73",
+        "city": "KOTA CIREBON",
+        "order_source": "csv",
+        "order_status": "Dikirim",
+    }])
+    assert insp._lbl_buyer_sub.text() == "M******o (******73)"
+    insp.set_rows([{
+        "resi": "SPX124",
+        "courier": "SPX",
+        "order_sn": "2611245NTCVVA3",
+        "buyer_username": "abqa.abqa",
+        "recipient_name": "****",
+        "recipient_phone": "****",
+        "city": "****",
+        "order_source": "shopee_api",
+        "order_status": "SHIPPED",
+    }])
+    assert insp._lbl_buyer_sub.text() == "Pembeli Shopee"
+    insp.close()
+
+    with tempfile.TemporaryDirectory() as td:
+        db = DB(Path(td) / "test.db")
+        try:
+            # 1. Start with partial Excel row
+            db.upsert({
+                "resi": "SPXUPG01",
+                "courier": "SPX",
+                "order_sn": "261124UPG01",
+                "buyer_username": "naanndaaaa",
+                "recipient_name": "M******o",
+                "recipient_phone": "******73",
+                "city": "KOTA CIREBON*",
+                "order_source": "csv",
+                "order_status": "Perlu Dikirim",
+            })
+            # 2. API sync with "****" must preserve Excel partials
+            db.upsert({
+                "resi": "SPXUPG01",
+                "courier": "SPX",
+                "order_sn": "261124UPG01",
+                "buyer_username": "naanndaaaa",
+                "recipient_name": "****",
+                "recipient_phone": "****",
+                "city": "****",
+                "order_source": "shopee_api",
+                "order_status": "SHIPPED",
+            })
+            r = db.get("SPXUPG01")
+            assert r["recipient_name"] == "M******o"
+            assert r["recipient_phone"] == "******73"
+            assert r["city"] == "KOTA CIREBON*"
+
+            # 3. API sync after PII is enabled upgrades partials to full unmasked PII
+            db.upsert({
+                "resi": "SPXUPG01",
+                "courier": "SPX",
+                "order_sn": "261124UPG01",
+                "buyer_username": "naanndaaaa",
+                "recipient_name": "Mulyono",
+                "recipient_phone": "0812345673",
+                "city": "KOTA CIREBON, JAWA BARAT",
+                "order_source": "shopee_api",
+                "order_status": "SHIPPED",
+            })
+            r = db.get("SPXUPG01")
+            assert r["recipient_name"] == "Mulyono"
+            assert r["recipient_phone"] == "0812345673"
+            assert r["city"] == "KOTA CIREBON, JAWA BARAT"
+
+            # 4. Subsequent Excel re-import with partials must NOT downgrade full unmasked PII
+            db.upsert({
+                "resi": "SPXUPG01",
+                "courier": "SPX",
+                "order_sn": "261124UPG01",
+                "buyer_username": "naanndaaaa",
+                "recipient_name": "M******o",
+                "recipient_phone": "******73",
+                "city": "KOTA CIREBON*",
+                "order_source": "csv",
+                "order_status": "Perlu Dikirim",
+            })
+            r = db.get("SPXUPG01")
+            assert r["recipient_name"] == "Mulyono"
+            assert r["recipient_phone"] == "0812345673"
+            assert r["city"] == "KOTA CIREBON, JAWA BARAT"
+        finally:
+            db.close()
+
+
+def test_shopee_sync_date_range_dialog_and_chunking():
+    from datetime import date, datetime
+    from unittest import mock
+    from PySide6.QtCore import QDate
+    from PySide6.QtWidgets import QApplication
+    from resitrack.db import DB
+    from resitrack.dialogs import ShopeeSyncDialog
+    from resitrack.shopee_api import ShopeeClient
+    from resitrack.workers import ShopeeSyncWorker
+
+    _app = QApplication.instance() or QApplication([])
+    dlg = ShopeeSyncDialog()
+    today = date.today()
+
+    # Default preset is last_15d -> (today - 14 days, today)
+    d1, d2 = dlg.date_range()
+    assert (d2 - d1).days + 1 == 15
+    assert d2 == today
+
+    # Named presets work cleanly on a fixed reference day
+    ref = date(2026, 11, 27)
+    dlg.apply_preset("today", today=ref)
+    assert dlg.date_range() == (date(2026, 11, 27), date(2026, 11, 27))
+    assert "1 hari" in dlg._lbl_summary.text()
+
+    dlg.apply_preset("yesterday", today=ref)
+    assert dlg.date_range() == (date(2026, 11, 26), date(2026, 11, 26))
+
+    dlg.apply_preset("last_7d", today=ref)
+    assert dlg.date_range() == (date(2026, 11, 21), date(2026, 11, 27))
+
+    dlg.apply_preset("this_month", today=ref)
+    assert dlg.date_range() == (date(2026, 11, 1), date(2026, 11, 27))
+
+    dlg.apply_preset("last_month", today=ref)
+    assert dlg.date_range() == (date(2026, 10, 1), date(2026, 10, 31))
+
+    # Reversed custom date inputs normalize automatically and yield exact 00:00:00..23:59:59 timestamps
+    dlg.dt_from.setDate(QDate(2026, 10, 20))
+    dlg.dt_to.setDate(QDate(2026, 10, 10))
+    assert dlg.date_range() == (date(2026, 10, 10), date(2026, 10, 20))
+    assert dlg._active_preset == ""
+    ts1, ts2 = dlg.timestamp_range()
+    assert ts1 == int(datetime(2026, 10, 10, 0, 0, 0).timestamp())
+    assert ts2 == int(datetime(2026, 10, 20, 23, 59, 59).timestamp())
+    dlg.close()
+
+    # ShopeeClient.order_list chunks a 31-day historical window strictly within [since_ts, until_ts]
+    c = ShopeeClient({
+        "shopee_partner_id": "123",
+        "shopee_partner_key": "secret",
+        "shopee_shop_id": "99",
+        "shopee_refresh_token": "tok",
+    })
+    hist_start = int(datetime(2026, 10, 1, 0, 0, 0).timestamp())
+    hist_end = int(datetime(2026, 10, 31, 23, 59, 59).timestamp())
+    windows: list[tuple[int, int]] = []
+
+    def fake_get(path, params):
+        if path == "/api/v2/order/get_order_list":
+            windows.append((params["time_from"], params["time_to"]))
+            return {"order_list": [{"order_sn": f"SN_{len(windows)}", "order_status": "SHIPPED"}], "more": False}
+        return {}
+
+    with mock.patch("time.time", return_value=hist_end + 86400 * 10), mock.patch.object(c, "get", side_effect=fake_get):
+        sns = c.order_list(since_ts=hist_start, until_ts=hist_end, time_range_field="create_time")
+    assert len(windows) == 3  # 31 days in <=15-day windows: 15d + 15d + ~1d
+    assert windows[0][0] == hist_start
+    assert windows[-1][1] == hist_end
+    for wf, wt in windows:
+        assert wt - wf < 15 * 86400
+    assert sns == ["SN_1", "SN_2", "SN_3"]
+
+    # Future until_ts clamps cleanly to `now`
+    fake_now = 1795700000
+    future_windows: list[tuple[int, int]] = []
+
+    def fake_get_future(path, params):
+        future_windows.append((params["time_from"], params["time_to"]))
+        return {"order_list": [], "more": False}
+
+    with mock.patch("time.time", return_value=fake_now), mock.patch.object(c, "get", side_effect=fake_get_future):
+        c.order_list(since_ts=fake_now - 3600, until_ts=fake_now + 50000)
+    assert future_windows == [(fake_now - 3600, fake_now)]
+
+    # ShopeeSyncWorker forwards both since_ts and until_ts to client.sync()
+    with tempfile.TemporaryDirectory() as td:
+        db = DB(Path(td) / "sync_worker.db")
+        try:
+            mock_client = mock.MagicMock()
+            mock_client.sync.return_value = []
+            w = ShopeeSyncWorker(
+                db, mock_client, days=11, since_ts=hist_start, until_ts=hist_end, time_range_field="create_time"
+            )
+            w.run()
+            mock_client.sync.assert_called_once()
+            _, kwargs = mock_client.sync.call_args
+            assert kwargs["since_ts"] == hist_start
+            assert kwargs["until_ts"] == hist_end
+            assert kwargs["time_range_field"] == "create_time"
+        finally:
+            db.close()
+
+
+def test_db_cross_source_dedup_merge_and_multi_file_import():
+    import json
+    from PySide6.QtWidgets import QApplication
+    import resitrack.config as cfg
+    import resitrack.db as db_mod
+    import resitrack.main_window as mw_mod
+    from resitrack.models import payment_details_dict
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        db = db_mod.DB(tmp / "dedup_merge.db")
+        try:
+            # 1. Case/whitespace normalization prevents duplicates
+            assert db.upsert({
+                "resi": "SPXID123",
+                "courier": "SPX",
+                "order_sn": "SN_DUP_1",
+                "buyer_username": "syukrinnah",
+                "order_source": "shopee_api",
+                "order_status": "SHIPPED",
+            }) == "new"
+            assert db.upsert({
+                "resi": "spxid-123 ",
+                "courier": "SPX",
+                "order_sn": " sn_dup_1 ",
+                "buyer_username": "syukrinnah",
+                "recipient_name": "M******n",
+                "recipient_phone": "******70",
+                "order_source": "csv",
+                "order_status": "Sedang Dikirim",
+            }) == "updated"
+            rows_all = db.all(True)
+            assert len(rows_all) == 1
+            assert rows_all[0]["resi"] == "SPXID123"
+            assert rows_all[0]["order_sn"] == "SN_DUP_1"
+            assert rows_all[0]["recipient_name"] == "M******n"
+            assert rows_all[0]["recipient_phone"] == "******70"
+
+            # 2. Cross-row collision: Row A (ORDER-SN_COL_1 with escrow) + Row B (SPXCOL1 without order_sn with tracking)
+            assert db.upsert({
+                "resi": "ORDER-SN_COL_1",
+                "courier": "SPX",
+                "order_sn": "SN_COL_1",
+                "buyer_username": "faras61",
+                "order_source": "shopee_api",
+                "order_status": "SHIPPED",
+                "payment_details_json": json.dumps({"escrow_amount": 178636, "seller_fees": 16364}),
+            }) == "new"
+            assert db.upsert({
+                "resi": "SPXCOL1",
+                "courier": "SPX",
+                "order_sn": "",
+                "order_source": "manual",
+            }) == "new"
+            db.conn.execute(
+                "UPDATE shipments SET last_event=?, last_event_time=?, tracking_source=?, events_json=?, last_checked=? WHERE resi=?",
+                (
+                    "Paket tiba di hub",
+                    "2026-11-27 11:00",
+                    "Shopee Open API",
+                    json.dumps([{"time": "2026-11-27 11:00", "description": "Paket tiba di hub", "location": ""}]),
+                    "2026-11-27 11:05",
+                    "SPXCOL1",
+                ),
+            )
+            db.conn.commit()
+            assert len(db.conn.execute("SELECT * FROM shipments WHERE order_sn='SN_COL_1' OR resi='SPXCOL1'").fetchall()) == 2
+
+            # Upsert linking SPXCOL1 + SN_COL_1 merges BOTH rows cleanly into 1 row
+            assert db.upsert({
+                "resi": "SPXCOL1",
+                "courier": "SPX",
+                "order_sn": "SN_COL_1",
+                "buyer_username": "faras61",
+                "recipient_name": "K**i",
+                "recipient_phone": "******07",
+                "order_source": "csv",
+                "order_status": "Sedang Dikirim",
+            }) == "updated"
+            col_rows = db.conn.execute("SELECT * FROM shipments WHERE order_sn='SN_COL_1' OR resi='SPXCOL1'").fetchall()
+            assert len(col_rows) == 1
+            merged = dict(col_rows[0])
+            assert merged["resi"] == "SPXCOL1"
+            assert merged["order_sn"] == "SN_COL_1"
+            assert merged["recipient_name"] == "K**i"
+            assert merged["recipient_phone"] == "******07"
+            assert merged["last_event"] == "Paket tiba di hub"
+            assert merged["last_checked"] == "2026-11-27 11:05"
+            assert payment_details_dict(merged)["escrow_amount"] == 178636
+        finally:
+            db.close()
+
+        # 3. MainWindow._import_paths handles multiple files in one batch without duplicating
+        db_path = tmp / "mw_multi.db"
+        settings_path = tmp / "settings.json"
+        settings_path.write_text('{"theme": "light", "inspector_open": true}', encoding="utf-8")
+        csv1 = tmp / "batch1.csv"
+        csv2 = tmp / "batch2.csv"
+        csv1.write_text(
+            "No. Resi,Opsi Pengiriman,No. Pesanan,Username (Pembeli),Nama Penerima,No. Telepon,Status Pesanan\n"
+            "SPXMUL1,SPX Express,261127MUL01,syukrinnah,M******n,******70,Sedang Dikirim\n"
+            "SPXMUL2,SPX Express,261127MUL02,faras61,K**i,******07,Sedang Dikirim\n",
+            encoding="utf-8-sig",
+        )
+        csv2.write_text(
+            "No. Resi,Opsi Pengiriman,No. Pesanan,Username (Pembeli),Nama Penerima,No. Telepon,Status Pesanan\n"
+            "SPXMUL2,SPX Express,261127MUL02,faras61,K**i,******07,Selesai\n"
+            "SPXMUL3,SPX Express,261127MUL03,yulianasihab,A******q,******15,Sedang Dikirim\n",
+            encoding="utf-8-sig",
+        )
+
+        old_cfg_db, old_cfg_set = cfg.DB_PATH, cfg.SETTINGS_PATH
+        old_load, old_save = mw_mod.load_settings, mw_mod.save_settings
+        try:
+            cfg.DB_PATH = db_path
+            cfg.SETTINGS_PATH = settings_path
+            mw_mod.load_settings = lambda: dict(cfg.DEFAULTS, auto_refresh_minutes=0)
+            mw_mod.save_settings = lambda s: None
+
+            db_mw = db_mod.DB(db_path)
+            # Pre-seed SPXMUL3 as a Shopee API order missing recipient info
+            db_mw.upsert({
+                "resi": "SPXMUL3",
+                "courier": "SPX",
+                "order_sn": "261127MUL03",
+                "buyer_username": "yulianasihab",
+                "order_source": "shopee_api",
+                "order_status": "SHIPPED",
+            })
+            db_mw.close()
+
+            _app = QApplication.instance() or QApplication([])
+            win = mw_mod.MainWindow(auto_sync=False)
+            win.track_rows = lambda *a, **kw: None
+            try:
+                win._import_paths([str(csv1), str(csv2)])
+                all_rows = [dict(r) for r in win.db.all(True)]
+                assert len(all_rows) == 3
+                assert win.model.rowCount() == 3
+                by_sn = {r["order_sn"]: r for r in all_rows}
+                assert by_sn["261127MUL01"]["recipient_name"] == "M******n"
+                assert by_sn["261127MUL02"]["order_status"] == "Selesai"
+                assert by_sn["261127MUL03"]["recipient_name"] == "A******q"
+                assert by_sn["261127MUL03"]["recipient_phone"] == "******15"
+            finally:
+                win.close()
+                win.db.close()
+        finally:
+            cfg.DB_PATH, cfg.SETTINGS_PATH = old_cfg_db, old_cfg_set
+            mw_mod.load_settings, mw_mod.save_settings = old_load, old_save
 
 
 if __name__ == "__main__":

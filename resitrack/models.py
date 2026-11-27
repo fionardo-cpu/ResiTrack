@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict, dataclass, field
+from datetime import date, datetime, timedelta
 from typing import Any
 
 # ==============================================================================
@@ -108,7 +109,7 @@ DELIVERED_KEYWORDS = (
     "delivered",
     "terkirim",
     "diterima oleh",
-    "diterima di ",
+    "delivery sukses",
     "received by",
     "sukses diterima",
     "telah diterima",
@@ -117,6 +118,74 @@ DELIVERED_KEYWORDS = (
     "berhasil dikirim",
     "paket diterima",
 )
+
+_STRONG_DELIVERED_KEYWORDS = (
+    "tiba di alamat tujuan",
+    "delivery sukses",
+    "sukses diterima",
+    "paket telah sampai",
+)
+
+_FACILITY_RECEIPT_GUARD = (
+    "drop point",
+    "droppoint",
+    "drop-point",
+    "mitra anteraja",
+    "agen ",
+    "agen/",
+    "agent",
+    "counter",
+    "konter",
+    "gudang",
+    "sortir",
+    "sorting",
+    "staging",
+    "warehouse",
+    "hub",
+    "gerai",
+    "outlet",
+    "cabang",
+    "kantor pos",
+    "loket",
+    "pickup",
+    "pick up",
+    "penjemputan",
+    "pihak jasa kirim",
+    "pihak ekspedisi",
+    "oleh kurir",
+    "oleh agen",
+    "oleh mitra",
+    "oleh ekspedisi",
+    "received at",
+    "facility",
+    "origin",
+    "transit",
+    "stasiun",
+    "gateway",
+    "pusat sortir",
+)
+
+_DELIVERED_NEGATION_GUARD = (
+    "belum terkirim",
+    "belum diterima",
+    "tidak terkirim",
+    "gagal kirim",
+    "gagal antar",
+)
+
+
+def is_delivered_event(text: str) -> bool:
+    """Return True only when an event description indicates buyer/destination delivery (never drop-off/hub receipts)."""
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if any(n in t for n in _DELIVERED_NEGATION_GUARD):
+        return False
+    if any(k in t for k in _STRONG_DELIVERED_KEYWORDS):
+        return True
+    if any(k in t for k in DELIVERED_KEYWORDS) and not any(g in t for g in _FACILITY_RECEIPT_GUARD):
+        return True
+    return False
 
 RETURN_COMPLETED_KEYWORDS = (
     "pesanan dikembalikan ke agen / pengirim",
@@ -250,7 +319,23 @@ DELIVERY_ATTEMPT_KEYWORDS = (
     "on delivery", "delivery attempt", "penerima menolak", "ditolak pembeli", "cod ditolak",
     "alamat tidak ditemukan", "rumah kosong", "pembeli menolak", "gagal serah terima",
     "delivery ticket creation", "delivering", "mengantarkan paket", "kurir ditugaskan",
-    "assigned to courier"
+    "assigned to courier", "satria sudah ditugaskan", "akan segera diantar ke penerima",
+    "diantar ke penerima",
+)
+
+OUT_FOR_DELIVERY_KEYWORDS = (
+    "out for delivery",
+    "sedang diantar",
+    "dibawa kurir",
+    "with delivery courier",
+    "kurir sedang",
+    "dalam proses pengantaran",
+    "akan dikirim ke alamat",
+    "proses antar",
+    "delivery courier",
+    "satria sudah ditugaskan",
+    "akan segera diantar ke penerima",
+    "diantar ke penerima",
 )
 
 RTS_KEYWORDS = (
@@ -296,11 +381,9 @@ def classify(text: str) -> str:
         return "RTS"
     if any(w in t for w in FAILURE_KEYWORDS):
         return "GAGAL"
-    if any(w in t for w in DELIVERED_KEYWORDS):
+    if is_delivered_event(t):
         return ST_DELIVERED
-    if any(w in t for w in ("out for delivery", "sedang diantar", "dibawa kurir",
-                            "with delivery courier", "kurir sedang", "dalam proses pengantaran",
-                            "akan dikirim ke alamat", "proses antar", "delivery courier")):
+    if any(w in t for w in OUT_FOR_DELIVERY_KEYWORDS):
         return ST_OUT
     if any(w in t for w in PRE_PICKUP_KEYWORDS):
         return ST_PENDING
@@ -338,13 +421,20 @@ def resolve_overall_status(
     ):
         return ST_COMPLETED
 
-    # Normalize events into text list
+    # Normalize events into text list (description + location for RTS/cancel, description-only for delivery checks)
     event_texts: list[str] = []
+    event_descs: list[str] = []
     for e in events or []:
         if isinstance(e, TrackEvent):
-            event_texts.append(f"{e.description} {e.location}".lower())
+            desc = (e.description or "").lower()
+            loc = (e.location or "").lower()
         elif isinstance(e, dict):
-            event_texts.append(f"{e.get('description', '')} {e.get('location', '')}".lower())
+            desc = str(e.get("description", "") or "").lower()
+            loc = str(e.get("location", "") or "").lower()
+        else:
+            continue
+        event_descs.append(desc)
+        event_texts.append(f"{desc} {loc}".strip())
 
     all_event_history_text = " ".join(event_texts)
 
@@ -409,16 +499,22 @@ def resolve_overall_status(
             return ST_CANCELED_BUYER
 
     # 4. Standard shipping progression
-    if trk_st == ST_DELIVERED or any(
-        any(k in ev for k in DELIVERED_KEYWORDS)
-        for ev in event_texts[:1]
-    ):
+    latest_desc = event_descs[0] if event_descs else ""
+    delivered_by_trk = (
+        trk_st == ST_DELIVERED
+        and (
+            not latest_desc
+            or is_delivered_event(latest_desc)
+            or not any(g in latest_desc for g in _FACILITY_RECEIPT_GUARD)
+        )
+    )
+    if delivered_by_trk or any(is_delivered_event(ev) for ev in event_descs[:1]):
         # Delivered to buyer, but Shopee order status is not yet "Selesai" (dana belum cair)
         return ST_DELIVERED
 
     if trk_st == ST_OUT or any(
-        any(k in ev for k in ("out for delivery", "sedang diantar", "dibawa kurir", "dalam proses pengantaran"))
-        for ev in event_texts[:1]
+        any(k in ev for k in OUT_FOR_DELIVERY_KEYWORDS)
+        for ev in event_descs[:1]
     ):
         return ST_OUT
 
@@ -620,18 +716,29 @@ def payment_details_dict(row: dict) -> dict[str, int]:
     return {}
 
 
+def is_masked_blank(val: str) -> bool:
+    """Return True if value is empty, '-', or purely non-alphanumeric masking like '****'."""
+    s = (val or "").strip()
+    if not s or s == "-":
+        return True
+    return not any(ch.isalnum() for ch in s)
+
+
 def recipient_dup_key(row: dict) -> str:
     """Normalized key for detecting orders sharing the same recipient name & phone (with city guard for masked PII)."""
-    name = re.sub(r"\s+", " ", (row.get("recipient_name") or "").strip()).lower()
-    raw_phone = re.sub(r"[\s\-+()]", "", (row.get("recipient_phone") or "").strip()).lower()
-    if not name or not raw_phone or name == "-" or raw_phone == "-":
+    raw_name = (row.get("recipient_name") or "").strip()
+    raw_phone_in = (row.get("recipient_phone") or "").strip()
+    if is_masked_blank(raw_name) or is_masked_blank(raw_phone_in):
         return ""
+    name = re.sub(r"\s+", " ", raw_name).lower()
+    raw_phone = re.sub(r"[\s\-+()]", "", raw_phone_in).lower()
     if "*" not in name and "*" not in raw_phone:
         digits = re.sub(r"\D", "", raw_phone)
         if digits.startswith("62"):
             digits = "0" + digits[2:]
         return f"{name}|{digits or raw_phone}"
-    city = re.sub(r"\s+", " ", (row.get("city") or "").strip()).lower()
+    raw_city = (row.get("city") or "").strip()
+    city = "" if is_masked_blank(raw_city) else re.sub(r"\s+", " ", raw_city).lower()
     return f"{name}|{raw_phone}|{city}"
 
 
@@ -655,3 +762,123 @@ def duplicate_resi_map(rows: list[dict]) -> dict[str, list[dict]]:
             if resi:
                 out[resi] = grp
     return out
+
+
+_MONTHS_ID = ("", "Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des")
+
+_DATE_WITH_TIME_FMTS = (
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y/%m/%d %H:%M:%S",
+    "%Y/%m/%d %H:%M",
+    "%d-%m-%Y %H:%M:%S",
+    "%d-%m-%Y %H:%M",
+    "%d/%m/%Y %H:%M:%S",
+    "%d/%m/%Y %H:%M",
+    "%Y-%m-%dT%H:%M:%S",
+)
+
+_DATE_ONLY_FMTS = (
+    "%Y-%m-%d",
+    "%Y/%m/%d",
+    "%d-%m-%Y",
+    "%d/%m/%Y",
+)
+
+
+def parse_date_str(val: str) -> str:
+    """Normalize date/datetime strings into 'YYYY-MM-DD HH:MM' or 'YYYY-MM-DD'."""
+    s = str(val or "").strip()
+    if not s or s.upper() in ("-", "NONE", "NULL", "NAN", "NAT"):
+        return ""
+    s_clean = re.sub(r"\.\d+(Z|[+-]\d{2}:?\d{2})?$", "", s).rstrip("Z")
+    for fmt in _DATE_WITH_TIME_FMTS:
+        try:
+            dt = datetime.strptime(s_clean[:19], fmt)
+            return dt.strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            continue
+    head = s_clean.split()[0].split("T")[0]
+    for fmt in _DATE_ONLY_FMTS:
+        try:
+            dt = datetime.strptime(head[:10], fmt)
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return ""
+
+
+def infer_date_from_order_sn(order_sn: str) -> str:
+    """Infer 'YYYY-MM-DD' from Shopee order_sn YYMMDD prefix (e.g., '261127ABC...' -> '2026-11-27')."""
+    sn = (order_sn or "").strip().upper()
+    m = re.match(r"^(\d{2})(\d{2})(\d{2})[A-Z0-9]{6,}$", sn)
+    if not m:
+        return ""
+    yy, mm, dd = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    try:
+        d = date(2000 + yy, mm, dd)
+        return d.strftime("%Y-%m-%d")
+    except ValueError:
+        return ""
+
+
+def row_order_date(row: dict) -> date | None:
+    """Return canonical order date using stored order_date -> order_sn YYMMDD -> created_at -> last_event_time."""
+    if not isinstance(row, dict):
+        return None
+    candidates = (
+        row.get("order_date") or "",
+        infer_date_from_order_sn(row.get("order_sn") or ""),
+        row.get("created_at") or "",
+        row.get("last_event_time") or "",
+    )
+    for raw in candidates:
+        s = str(raw or "").strip()
+        if not s:
+            continue
+        norm = parse_date_str(s) or s
+        m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", norm)
+        if m:
+            try:
+                return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            except ValueError:
+                continue
+    return None
+
+
+def format_date_short(d: date) -> str:
+    """Format date cleanly in Indonesian (e.g., '27 Nov 2026')."""
+    return f"{d.day:02d} {_MONTHS_ID[d.month]} {d.year}"
+
+
+def resolve_date_range(
+    preset: str,
+    custom_from: date | None = None,
+    custom_to: date | None = None,
+    today: date | None = None,
+) -> tuple[date | None, date | None]:
+    """Resolve date filter preset ('today'|'yesterday'|'this_week'|'last_7d'|'this_month'|'last_month'|'custom') -> (start, end)."""
+    ref = today or date.today()
+    p = (preset or "").strip().lower()
+    if not p or p == "all":
+        return (None, None)
+    if p == "today":
+        return (ref, ref)
+    if p == "yesterday":
+        y = ref - timedelta(days=1)
+        return (y, y)
+    if p == "this_week":
+        return (ref - timedelta(days=ref.weekday()), ref)
+    if p == "last_7d":
+        return (ref - timedelta(days=6), ref)
+    if p == "this_month":
+        return (ref.replace(day=1), ref)
+    if p == "last_month":
+        last_prev = ref.replace(day=1) - timedelta(days=1)
+        return (last_prev.replace(day=1), last_prev)
+    if p == "custom":
+        d1, d2 = custom_from, custom_to
+        if d1 is not None and d2 is not None and d1 > d2:
+            d1, d2 = d2, d1
+        return (d1, d2)
+    return (None, None)

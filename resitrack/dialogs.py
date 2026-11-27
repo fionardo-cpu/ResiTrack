@@ -2,17 +2,20 @@
 from __future__ import annotations
 
 import webbrowser
+from datetime import date, datetime, timedelta
 
-from PySide6.QtCore import QRegularExpression, Qt
+from PySide6.QtCore import QDate, QRegularExpression, Qt
 from PySide6.QtGui import QIcon, QRegularExpressionValidator
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDateEdit,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLayout,
@@ -30,7 +33,7 @@ from PySide6.QtWidgets import (
 from .config import assets_dir
 from .couriers import detect_courier, normalize_resi
 from .icons import svg_icon
-from .models import COURIERS
+from .models import COURIERS, format_date_short, resolve_date_range
 from .theme import apply_windows_titlebar_theme, get_tokens
 
 ICON_PATH = assets_dir() / "icon.png"
@@ -295,11 +298,24 @@ class SettingsDialog(QDialog):
         self.use_trk.setCursor(Qt.PointingHandCursor)
         self.use_trk.setChecked(bool(self.s.get("shopee_use_tracking_api", True)))
 
+        self.shopee_auto_sync = QCheckBox("Sinkron otomatis pesanan && resi baru secara realtime")
+        self.shopee_auto_sync.setCursor(Qt.PointingHandCursor)
+        self.shopee_auto_sync.setChecked(bool(self.s.get("shopee_auto_sync_enabled", True)))
+
+        self.shopee_sync_interval = QSpinBox()
+        self.shopee_sync_interval.setCursor(Qt.IBeamCursor)
+        self.shopee_sync_interval.setMinimumHeight(36)
+        self.shopee_sync_interval.setRange(1, 60)
+        self.shopee_sync_interval.setSuffix(" menit")
+        self.shopee_sync_interval.setValue(max(1, int(self.s.get("shopee_auto_sync_minutes", 2) or 2)))
+
         f_shp.addRow("Partner ID:", self.pid)
         f_shp.addRow("Partner Key:", self.pkey)
         f_shp.addRow("Redirect URL:", self.redirect)
         f_shp.addRow("", self.sandbox)
         f_shp.addRow("", self.use_trk)
+        f_shp.addRow("", self.shopee_auto_sync)
+        f_shp.addRow("Cek Shopee tiap:", self.shopee_sync_interval)
         v_shp.addLayout(f_shp)
 
         auth_card = QFrame()
@@ -397,6 +413,8 @@ class SettingsDialog(QDialog):
         self.s["shopee_redirect_url"] = self.redirect.text().strip() or "https://www.google.com"
         self.s["shopee_sandbox"] = new_sandbox
         self.s["shopee_use_tracking_api"] = self.use_trk.isChecked()
+        self.s["shopee_auto_sync_enabled"] = self.shopee_auto_sync.isChecked()
+        self.s["shopee_auto_sync_minutes"] = max(1, int(self.shopee_sync_interval.value()))
 
     def _update_state(self):
         t = get_tokens(self._is_dark)
@@ -471,3 +489,167 @@ class SettingsDialog(QDialog):
 
     def result_settings(self) -> dict:
         return self.s
+
+
+class ShopeeSyncDialog(QDialog):
+    """Minimalist date-range picker for pulling orders from Shopee Open Platform API."""
+
+    _PRESETS = (
+        ("today", "Hari Ini"),
+        ("yesterday", "Kemarin"),
+        ("last_7d", "7 Hari"),
+        ("last_15d", "15 Hari"),
+        ("this_month", "Bulan Ini"),
+        ("last_month", "Bulan Lalu"),
+    )
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Tarik Pesanan Shopee")
+        if ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(ICON_PATH)))
+        self.setMinimumWidth(420)
+        self._is_dark = _parent_is_dark(parent)
+        apply_windows_titlebar_theme(self, self._is_dark)
+        self._updating = False
+        self._active_preset = "last_15d"
+        self._preset_btns: dict[str, QPushButton] = {}
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(22, 20, 22, 20)
+        lay.setSpacing(14)
+
+        desc = QLabel("Pilih rentang tanggal pesanan yang ingin ditarik dari Shopee Open API.")
+        desc.setObjectName("MutedText")
+        desc.setWordWrap(True)
+        lay.addWidget(desc)
+
+        preset_hdr = QLabel("PILIH CEPAT")
+        preset_hdr.setObjectName("SectionOverline")
+        lay.addWidget(preset_hdr)
+
+        preset_grid = QGridLayout()
+        preset_grid.setSpacing(8)
+        for idx, (key, title) in enumerate(self._PRESETS):
+            btn = QPushButton(title)
+            btn.setCheckable(True)
+            btn.setFixedHeight(30)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda _checked=False, k=key: self.apply_preset(k))
+            self._preset_btns[key] = btn
+            preset_grid.addWidget(btn, idx // 3, idx % 3)
+        lay.addLayout(preset_grid)
+
+        date_row = QHBoxLayout()
+        date_row.setSpacing(12)
+        max_qd = QDate.currentDate()
+
+        def _make_date_col(label_txt: str) -> QDateEdit:
+            col = QVBoxLayout()
+            col.setSpacing(5)
+            lbl = QLabel(label_txt)
+            lbl.setObjectName("MutedText")
+            de = QDateEdit()
+            de.setCalendarPopup(True)
+            de.setDisplayFormat("dd MMM yyyy")
+            de.setMaximumDate(max_qd)
+            de.setMinimumHeight(36)
+            de.setCursor(Qt.PointingHandCursor)
+            de.dateChanged.connect(self._on_date_edited)
+            col.addWidget(lbl)
+            col.addWidget(de)
+            date_row.addLayout(col, 1)
+            return de
+
+        self.dt_from = _make_date_col("Dari Tanggal")
+        self.dt_to = _make_date_col("Sampai Tanggal")
+        lay.addLayout(date_row)
+
+        self._lbl_summary = QLabel()
+        self._lbl_summary.setObjectName("MutedText")
+        self._lbl_summary.setWordWrap(True)
+        lay.addWidget(self._lbl_summary)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        ok_btn = bb.button(QDialogButtonBox.Ok)
+        cancel_btn = bb.button(QDialogButtonBox.Cancel)
+        ok_btn.setText("Tarik Pesanan")
+        cancel_btn.setText("Batal")
+        ok_btn.setObjectName("PrimaryBtn")
+        cancel_btn.setObjectName("SecondaryBtn")
+        ok_btn.setCursor(Qt.PointingHandCursor)
+        cancel_btn.setCursor(Qt.PointingHandCursor)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+        self.apply_preset("last_15d")
+
+    def _style_presets(self) -> None:
+        t = get_tokens(self._is_dark)
+        for key, btn in self._preset_btns.items():
+            active = (key == self._active_preset)
+            btn.setChecked(active)
+            if active:
+                btn.setStyleSheet(
+                    f"QPushButton {{ background-color: {t['accent_soft']}; color: {t['accent']}; "
+                    f"border: 1px solid {t['accent']}; border-radius: 7px; font-size: 12px; font-weight: 600; }}"
+                )
+            else:
+                btn.setStyleSheet(
+                    f"QPushButton {{ background-color: {t['bg_subtle']}; color: {t['text_secondary']}; "
+                    f"border: 1px solid {t['border_hairline']}; border-radius: 7px; font-size: 12px; font-weight: 500; }}"
+                    f"QPushButton:hover {{ border-color: {t['border_hover']}; color: {t['text_primary']}; }}"
+                )
+
+    def _on_date_edited(self, *_args) -> None:
+        if self._updating:
+            return
+        self._active_preset = ""
+        self._style_presets()
+        self._refresh_summary()
+
+    def apply_preset(self, key: str, today: date | None = None) -> None:
+        """Apply a named preset ('today'|'yesterday'|'last_7d'|'last_15d'|'this_month'|'last_month')."""
+        ref = today or date.today()
+        if key == "last_15d":
+            d1, d2 = ref - timedelta(days=14), ref
+        else:
+            d1, d2 = resolve_date_range(key, today=ref)
+            if d1 is None or d2 is None:
+                d1, d2 = ref - timedelta(days=14), ref
+        self._updating = True
+        try:
+            self.dt_from.setDate(QDate(d1.year, d1.month, d1.day))
+            self.dt_to.setDate(QDate(d2.year, d2.month, d2.day))
+        finally:
+            self._updating = False
+        self._active_preset = key
+        self._style_presets()
+        self._refresh_summary()
+
+    def date_range(self) -> tuple[date, date]:
+        """Return normalized (start_date, end_date) with start_date <= end_date."""
+        qf = self.dt_from.date()
+        qt = self.dt_to.date()
+        d1 = date(qf.year(), qf.month(), qf.day())
+        d2 = date(qt.year(), qt.month(), qt.day())
+        if d1 > d2:
+            d1, d2 = d2, d1
+        return d1, d2
+
+    def timestamp_range(self) -> tuple[int, int]:
+        """Return local day-boundary Unix timestamps (start 00:00:00, end 23:59:59)."""
+        d1, d2 = self.date_range()
+        ts1 = int(datetime(d1.year, d1.month, d1.day, 0, 0, 0).timestamp())
+        ts2 = int(datetime(d2.year, d2.month, d2.day, 23, 59, 59).timestamp())
+        return ts1, ts2
+
+    def _refresh_summary(self) -> None:
+        d1, d2 = self.date_range()
+        span = (d2 - d1).days + 1
+        base = format_date_short(d1) if d1 == d2 else f"{format_date_short(d1)} – {format_date_short(d2)}"
+        txt = f"{base} ({span} hari)"
+        if span > 90:
+            txt += " · rentang panjang bisa memakan waktu lebih lama"
+        self._lbl_summary.setText(txt)

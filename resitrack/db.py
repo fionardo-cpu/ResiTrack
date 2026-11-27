@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from . import config
+from .couriers import normalize_resi
 from .models import (
     CAT_ACTIVE,
     CAT_OTHER,
@@ -19,6 +20,8 @@ from .models import (
     ST_RTS_REJECTED,
     ST_RTS_RETURN,
     ST_TRANSIT,
+    infer_date_from_order_sn,
+    is_masked_blank,
     merge_products,
     resolve_overall_status,
     row_lifecycle,
@@ -51,6 +54,7 @@ CREATE TABLE IF NOT EXISTS shipments (
     payment_method     TEXT DEFAULT '',          -- COD (Bayar di Tempat) | QRIS | Saldo ShopeePay | dll
     total_payment      INTEGER DEFAULT 0,        -- Total Pembayaran pembeli (IDR)
     payment_details_json TEXT DEFAULT '{}',      -- Rincian biaya pesanan (subtotal, ongkir, voucher, layanan)
+    order_date         TEXT DEFAULT '',          -- Waktu pesanan dibuat (YYYY-MM-DD atau YYYY-MM-DD HH:MM)
     created_at         TEXT,
     last_checked       TEXT DEFAULT ''
 );
@@ -62,8 +66,45 @@ FIELDS = [
     "resi", "courier", "order_sn", "buyer_username", "recipient_name",
     "recipient_phone", "city", "product", "order_source", "order_status",
     "cancel_by", "cancel_reason", "payment_method", "total_payment",
-    "payment_details_json", "note"
+    "payment_details_json", "order_date", "note"
 ]
+
+
+def _norm_order_sn(val: str) -> str:
+    return (val or "").strip().upper()
+
+
+def _norm_resi_key(raw_resi: str, order_sn: str = "") -> str:
+    r = (raw_resi or "").strip()
+    sn = _norm_order_sn(order_sn)
+    if not r:
+        return f"ORDER-{sn}" if sn else ""
+    if r.upper().startswith("ORDER-"):
+        return f"ORDER-{r[6:].strip().upper()}"
+    return normalize_resi(r) or r.upper()
+
+
+def _merge_payment_details_json(cur_raw: str, inc_raw: str) -> str:
+    """Merge non-zero numeric keys from two payment_details_json strings."""
+    cur_pd = (cur_raw or "").strip()
+    inc_pd = (inc_raw or "").strip()
+    if not inc_pd or inc_pd == "{}":
+        return cur_pd or "{}"
+    if not cur_pd or cur_pd == "{}":
+        return inc_pd
+    try:
+        cur_d = json.loads(cur_pd)
+        inc_d = json.loads(inc_pd)
+        if isinstance(cur_d, dict) and isinstance(inc_d, dict):
+            merged_d = dict(cur_d)
+            for dk, dv in inc_d.items():
+                if dv and not merged_d.get(dk):
+                    merged_d[dk] = dv
+            if merged_d != cur_d:
+                return json.dumps(merged_d, ensure_ascii=False)
+    except Exception:
+        pass
+    return cur_pd
 
 
 def _order_status_rank(status_text: str) -> int:
@@ -72,12 +113,14 @@ def _order_status_rank(status_text: str) -> int:
     if not s:
         return 0
     if any(k in s for k in ("selesai", "completed", "batal", "cancel", "pengembalian", "retur", "return", "refund")):
+        return 5
+    if any(k in s for k in ("terkirim", "delivered", "to_confirm_receive")):
         return 4
-    if any(k in s for k in ("terkirim", "delivered")):
-        return 3
     if any(k in s for k in ("sedang dikirim", "telah dikirim", "shipped", "in_transit")):
+        return 3
+    if any(k in s for k in ("processed", "siap dikirim", "sedang diproses")):
         return 2
-    if any(k in s for k in ("perlu dikirim", "to_ship", "ready_to_ship", "sedang dikemas", "belum")):
+    if any(k in s for k in ("perlu dikirim", "to_ship", "ready_to_ship", "retry_ship", "sedang dikemas", "belum")):
         return 1
     return 1
 
@@ -101,12 +144,33 @@ class DB:
             "ALTER TABLE shipments ADD COLUMN payment_method TEXT DEFAULT ''",
             "ALTER TABLE shipments ADD COLUMN total_payment INTEGER DEFAULT 0",
             "ALTER TABLE shipments ADD COLUMN payment_details_json TEXT DEFAULT '{}'",
+            "ALTER TABLE shipments ADD COLUMN order_date TEXT DEFAULT ''",
         ):
             try:
                 self.conn.execute(ddl)
                 self.conn.commit()
             except Exception:
                 pass
+        missing_dates = self.conn.execute(
+            "SELECT id, order_sn, created_at FROM shipments WHERE order_date IS NULL OR order_date=''"
+        ).fetchall()
+        for md in missing_dates:
+            inferred = infer_date_from_order_sn(md["order_sn"] or "") or ((md["created_at"] or "")[:10])
+            if inferred:
+                self.conn.execute("UPDATE shipments SET order_date=? WHERE id=?", (inferred, md["id"]))
+        masked_rows = self.conn.execute(
+            "SELECT id, recipient_name, recipient_phone, city FROM shipments "
+            "WHERE recipient_name LIKE '%*%' OR recipient_phone LIKE '%*%' OR city LIKE '%*%'"
+        ).fetchall()
+        for mr in masked_rows:
+            upd_cols: dict[str, str] = {}
+            for col in ("recipient_name", "recipient_phone", "city"):
+                v = (mr[col] or "").strip()
+                if v and is_masked_blank(v):
+                    upd_cols[col] = ""
+            if upd_cols:
+                sets = ",".join(f"{k}=?" for k in upd_cols)
+                self.conn.execute(f"UPDATE shipments SET {sets} WHERE id=?", (*upd_cols.values(), mr["id"]))
         self.conn.execute(
             "UPDATE shipments SET status=? WHERE status IN ('Pengiriman Gagal - BalSis', 'Pengiriman Gagal - Balsis')",
             (ST_RTS_BALSIS,),
@@ -183,57 +247,129 @@ class DB:
             if new_st == ST_PENDING:
                 self.conn.execute("UPDATE shipments SET status=? WHERE id=?", (ST_PENDING, pr["id"]))
 
+        from .models import ST_OUT
+        # Heal ST_DELIVERED drop-point/facility false positives & Anteraja SATRIA out-for-delivery rows
+        heal_rows = self.conn.execute(
+            "SELECT id, status, order_status, cancel_by, cancel_reason, events_json FROM shipments "
+            "WHERE status IN (?, ?) AND events_json IS NOT NULL AND events_json != '' AND events_json != '[]'",
+            (ST_DELIVERED, ST_TRANSIT),
+        ).fetchall()
+        for hr in heal_rows:
+            try:
+                evs = json.loads(hr["events_json"] or "[]")
+            except Exception:
+                evs = []
+            if not evs:
+                continue
+            new_st = resolve_overall_status(
+                hr["order_status"] or "", "", evs, hr["cancel_by"] or "", hr["cancel_reason"] or ""
+            )
+            cur_st = hr["status"] or ""
+            if cur_st == ST_DELIVERED and new_st != ST_DELIVERED:
+                self.conn.execute("UPDATE shipments SET status=? WHERE id=?", (new_st, hr["id"]))
+            elif cur_st == ST_TRANSIT and new_st == ST_OUT:
+                self.conn.execute("UPDATE shipments SET status=? WHERE id=?", (ST_OUT, hr["id"]))
+
         self.conn.commit()
         self._deduplicate_existing()
+
+    def _merge_row_pair_updates(self, keeper, dup_rows: list) -> dict[str, Any]:
+        """Compute merged column updates on keeper from one or more duplicate rows."""
+        updates: dict[str, Any] = {}
+        cur_prod = keeper["product"] or ""
+        cur_ord_st = keeper["order_status"] or ""
+        cur_pd = (keeper["payment_details_json"] or "").strip()
+
+        for dup in dup_rows:
+            for f in ("courier", "order_sn", "buyer_username", "cancel_by", "cancel_reason", "payment_method", "note"):
+                cur_val = (updates.get(f, keeper[f]) or "").strip()
+                d_val = _norm_order_sn(dup[f] or "") if f == "order_sn" else (dup[f] or "").strip()
+                if not cur_val and d_val:
+                    updates[f] = d_val
+
+            for f in ("recipient_name", "recipient_phone"):
+                cur_val = (updates.get(f, keeper[f]) or "").strip()
+                d_val = (dup[f] or "").strip()
+                if d_val and not is_masked_blank(d_val) and (
+                    not cur_val or is_masked_blank(cur_val) or ("*" in cur_val and "*" not in d_val)
+                ):
+                    updates[f] = d_val
+
+            cur_city = (updates.get("city", keeper["city"]) or "").strip()
+            d_city = (dup["city"] or "").strip()
+            if d_city and not is_masked_blank(d_city) and (
+                not cur_city
+                or is_masked_blank(cur_city)
+                or ("*" in cur_city and "*" not in d_city)
+                or (len(d_city) > len(cur_city) and cur_city in d_city)
+            ):
+                updates["city"] = d_city
+
+            cur_od = (updates.get("order_date", keeper["order_date"]) or "").strip()
+            d_od = (dup["order_date"] or "").strip()
+            if d_od and (not cur_od or (len(d_od) > len(cur_od) and d_od.startswith(cur_od))):
+                updates["order_date"] = d_od
+
+            if int(updates.get("total_payment", keeper["total_payment"]) or 0) == 0 and int(dup["total_payment"] or 0) > 0:
+                updates["total_payment"] = int(dup["total_payment"])
+
+            merged_pd = _merge_payment_details_json(cur_pd, dup["payment_details_json"] or "")
+            if merged_pd != cur_pd:
+                cur_pd = merged_pd
+                updates["payment_details_json"] = merged_pd
+
+            # Preserve tracking history if keeper hasn't been tracked yet while dup has tracking data
+            cur_lc = (updates.get("last_checked", keeper["last_checked"]) or "").strip()
+            d_lc = (dup["last_checked"] or "").strip()
+            cur_ev = (updates.get("events_json", keeper["events_json"]) or "").strip()
+            d_ev = (dup["events_json"] or "").strip()
+            if (not cur_lc and d_lc) or ((not cur_ev or cur_ev == "[]") and d_ev and d_ev != "[]"):
+                for tf in ("last_event", "last_event_time", "tracking_source", "events_json", "last_checked", "error"):
+                    if dup[tf] is not None:
+                        updates[tf] = dup[tf]
+
+            cur_prod = merge_products(cur_prod, dup["product"] or "")
+            if _order_status_rank(dup["order_status"] or "") > _order_status_rank(cur_ord_st):
+                cur_ord_st = dup["order_status"] or ""
+
+        if cur_prod != (keeper["product"] or ""):
+            updates["product"] = cur_prod
+        if cur_ord_st != (keeper["order_status"] or "") or "last_checked" in updates:
+            if cur_ord_st != (keeper["order_status"] or ""):
+                updates["order_status"] = cur_ord_st
+            evs = json.loads(updates.get("events_json", keeper["events_json"] or "[]") or "[]")
+            trk_hint = keeper["status"] if not evs else ""
+            new_st = resolve_overall_status(
+                cur_ord_st,
+                trk_hint,
+                evs,
+                updates.get("cancel_by", keeper["cancel_by"] or ""),
+                updates.get("cancel_reason", keeper["cancel_reason"] or ""),
+            )
+            if new_st != (keeper["status"] or ""):
+                updates["status"] = new_st
+        return updates
 
     def _deduplicate_existing(self):
         """Clean up pre-existing duplicate order_sn rows safely (keeping best tracking record)."""
         dup_orders = self.conn.execute(
-            "SELECT order_sn FROM shipments WHERE order_sn != '' GROUP BY order_sn HAVING COUNT(*) > 1"
+            "SELECT UPPER(TRIM(order_sn)) AS norm_sn FROM shipments "
+            "WHERE TRIM(order_sn) != '' GROUP BY UPPER(TRIM(order_sn)) HAVING COUNT(*) > 1"
         ).fetchall()
         for drow in dup_orders:
-            sn = drow["order_sn"]
+            sn = drow["norm_sn"]
             rows = self.conn.execute(
-                """SELECT * FROM shipments WHERE order_sn=?
+                """SELECT * FROM shipments WHERE UPPER(TRIM(order_sn))=?
                    ORDER BY CASE WHEN resi LIKE 'ORDER-%' THEN 1 ELSE 0 END ASC,
                             CASE WHEN last_checked != '' THEN 0 ELSE 1 END ASC,
                             id ASC""",
                 (sn,),
             ).fetchall()
             keeper = rows[0]
-            keeper_id = keeper["id"]
-            updates: dict[str, Any] = {}
-            cur_prod = keeper["product"] or ""
-            cur_ord_st = keeper["order_status"] or ""
-
-            for dup in rows[1:]:
-                for f in ("courier", "buyer_username", "recipient_name", "recipient_phone", "city", "payment_method", "note"):
-                    if not (keeper[f] or updates.get(f)) and dup[f]:
-                        updates[f] = dup[f]
-                if int(keeper["total_payment"] or updates.get("total_payment") or 0) == 0 and int(dup["total_payment"] or 0) > 0:
-                    updates["total_payment"] = int(dup["total_payment"])
-                cur_pd = (updates.get("payment_details_json") or keeper["payment_details_json"] or "").strip()
-                dup_pd = (dup["payment_details_json"] or "").strip()
-                if (not cur_pd or cur_pd == "{}") and dup_pd and dup_pd != "{}":
-                    updates["payment_details_json"] = dup_pd
-                cur_prod = merge_products(cur_prod, dup["product"] or "")
-                if _order_status_rank(dup["order_status"] or "") > _order_status_rank(cur_ord_st):
-                    cur_ord_st = dup["order_status"] or ""
-
-            if cur_prod != (keeper["product"] or ""):
-                updates["product"] = cur_prod
-            if cur_ord_st != (keeper["order_status"] or ""):
-                updates["order_status"] = cur_ord_st
-                evs = json.loads(keeper["events_json"] or "[]")
-                updates["status"] = resolve_overall_status(
-                    cur_ord_st, keeper["status"], evs,
-                    updates.get("cancel_by", keeper["cancel_by"] or ""),
-                    updates.get("cancel_reason", keeper["cancel_reason"] or ""),
-                )
-
+            updates = self._merge_row_pair_updates(keeper, rows[1:])
             if updates:
                 sets = ",".join(f"{k}=?" for k in updates)
-                self.conn.execute(f"UPDATE shipments SET {sets} WHERE id=?", (*updates.values(), keeper_id))
+                self.conn.execute(f"UPDATE shipments SET {sets} WHERE id=?", (*updates.values(), keeper["id"]))
             dup_ids = [(dup["id"],) for dup in rows[1:]]
             self.conn.executemany("DELETE FROM shipments WHERE id=?", dup_ids)
         if dup_orders:
@@ -243,29 +379,60 @@ class DB:
     def upsert(self, data: dict) -> str:
         """Insert or smart-merge a shipment by resi OR order_sn.
 
-        - Prevents duplicate orders when re-importing Shopee exports.
+        - Prevents duplicate orders when re-importing Shopee exports or mixing API + Excel.
         - Upgrades ORDER-{sn} placeholder to a real resi in-place.
         - Never downgrades a finalized order status when an older export is imported.
         Returns 'new' | 'updated' | 'same'.
         """
-        resi = (data.get("resi") or "").strip()
-        order_sn = (data.get("order_sn") or "").strip()
+        order_sn = _norm_order_sn(data.get("order_sn") or "")
+        resi = _norm_resi_key(data.get("resi") or "", order_sn)
         if not resi and not order_sn:
             raise ValueError("Resi atau order_sn kosong")
-        if not resi:
-            resi = f"ORDER-{order_sn}"
 
         with self._lock:
-            row = self.conn.execute("SELECT * FROM shipments WHERE resi=?", (resi,)).fetchone()
-            if row is None and order_sn:
-                row = self.conn.execute(
-                    """SELECT * FROM shipments WHERE order_sn=?
-                       ORDER BY CASE WHEN resi LIKE 'ORDER-%' THEN 1 ELSE 0 END ASC, id ASC LIMIT 1""",
+            row_resi = self.conn.execute(
+                "SELECT * FROM shipments WHERE UPPER(TRIM(resi))=?", (resi,)
+            ).fetchone()
+            row_sn = None
+            if order_sn:
+                row_sn = self.conn.execute(
+                    """SELECT * FROM shipments WHERE UPPER(TRIM(order_sn))=?
+                       ORDER BY CASE WHEN resi LIKE 'ORDER-%' THEN 1 ELSE 0 END ASC,
+                                CASE WHEN last_checked != '' THEN 0 ELSE 1 END ASC,
+                                id ASC LIMIT 1""",
                     (order_sn,),
                 ).fetchone()
 
+            merged_dup = False
+            if row_resi is not None and row_sn is not None and row_resi["id"] != row_sn["id"]:
+                resi_is_ph = str(row_resi["resi"] or "").startswith("ORDER-")
+                sn_is_ph = str(row_sn["resi"] or "").startswith("ORDER-")
+                if resi_is_ph and not sn_is_ph:
+                    keeper, loser = row_sn, row_resi
+                else:
+                    keeper, loser = row_resi, row_sn
+                merge_upd = self._merge_row_pair_updates(keeper, [loser])
+                self.conn.execute("DELETE FROM shipments WHERE id=?", (loser["id"],))
+                if merge_upd:
+                    sets = ",".join(f"{k}=?" for k in merge_upd)
+                    self.conn.execute(f"UPDATE shipments SET {sets} WHERE id=?", (*merge_upd.values(), keeper["id"]))
+                self.conn.commit()
+                row = self.conn.execute("SELECT * FROM shipments WHERE id=?", (keeper["id"],)).fetchone()
+                merged_dup = True
+            else:
+                row = row_resi if row_resi is not None else row_sn
+
             if row is None:
                 clean_data = dict(data, resi=resi)
+                if order_sn:
+                    clean_data["order_sn"] = order_sn
+                for pii_f in ("recipient_name", "recipient_phone", "city"):
+                    if pii_f in clean_data and is_masked_blank(clean_data[pii_f] or ""):
+                        clean_data[pii_f] = ""
+                if not (clean_data.get("order_date") or "").strip():
+                    inferred_od = infer_date_from_order_sn(order_sn)
+                    if inferred_od:
+                        clean_data["order_date"] = inferred_od
                 cols = [f for f in FIELDS if f in clean_data]
                 vals = []
                 for f in cols:
@@ -313,23 +480,43 @@ class DB:
                     changes["tracking_source"] = ""
                     changes["error"] = ""
 
-            for f in ("courier", "order_sn", "buyer_username", "recipient_name", "recipient_phone", "cancel_by", "cancel_reason", "payment_method", "note"):
-                val = (data.get(f) or "").strip()
+            for f in ("courier", "order_sn", "buyer_username", "cancel_by", "cancel_reason", "payment_method", "note"):
+                val = order_sn if f == "order_sn" else (data.get(f) or "").strip()
                 if val and not (row[f] or "").strip():
                     changes[f] = val
+
+            # Preserve partially masked Excel recipient/phone/city; never overwrite with empty or "****",
+            # but allow automatic upgrade from partial ("M******o") to full unmasked PII ("Mulyono").
+            for f in ("recipient_name", "recipient_phone"):
+                val = (data.get(f) or "").strip()
+                ex_val = (row[f] or "").strip()
+                if val and not is_masked_blank(val) and (
+                    not ex_val or is_masked_blank(ex_val) or ("*" in ex_val and "*" not in val)
+                ):
+                    changes[f] = val
+
+            in_od = (data.get("order_date") or "").strip() or infer_date_from_order_sn(order_sn)
+            ex_od = (row["order_date"] or "").strip()
+            if in_od and (not ex_od or (len(in_od) > len(ex_od) and in_od.startswith(ex_od))):
+                changes["order_date"] = in_od
 
             in_tp = int(data.get("total_payment") or 0)
             if in_tp > 0 and int(row["total_payment"] or 0) == 0:
                 changes["total_payment"] = in_tp
 
-            in_pd = (data.get("payment_details_json") or "").strip()
             ex_pd = (row["payment_details_json"] or "").strip()
-            if in_pd and in_pd != "{}" and (not ex_pd or ex_pd == "{}"):
-                changes["payment_details_json"] = in_pd
+            merged_pd = _merge_payment_details_json(ex_pd, data.get("payment_details_json") or "")
+            if merged_pd != ex_pd and merged_pd != "{}":
+                changes["payment_details_json"] = merged_pd
 
             in_city = (data.get("city") or "").strip()
             ex_city = (row["city"] or "").strip()
-            if in_city and (not ex_city or (len(in_city) > len(ex_city) and ex_city in in_city)):
+            if in_city and not is_masked_blank(in_city) and (
+                not ex_city
+                or is_masked_blank(ex_city)
+                or ("*" in ex_city and "*" not in in_city)
+                or (len(in_city) > len(ex_city) and ex_city in in_city)
+            ):
                 changes["city"] = in_city
 
             merged_prod = merge_products(row["product"] or "", data.get("product") or "")
@@ -359,7 +546,7 @@ class DB:
                     changes["status"] = new_st
 
             if not changes:
-                return "same"
+                return "updated" if merged_dup else "same"
 
             sets = ",".join(f"{k}=?" for k in changes)
             self.conn.execute(f"UPDATE shipments SET {sets} WHERE id=?", (*changes.values(), row["id"]))

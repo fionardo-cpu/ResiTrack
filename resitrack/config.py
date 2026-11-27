@@ -56,6 +56,10 @@ DEFAULTS: dict = {
     "shopee_redirect_url": "https://www.google.com",
     "shopee_use_tracking_api": True,       # use logistics.get_tracking_info for Shopee-synced orders
     "shopee_sandbox": False,
+    "shopee_auto_sync_enabled": True,      # background incremental sync for new/updated orders
+    "shopee_auto_sync_minutes": 2,
+    "shopee_last_sync_at": "",
+    "shopee_last_sync_ts": 0,
     # Behaviour
     "theme": "light",                     # "light" | "dark"
     "inspector_open": True,

@@ -16,6 +16,7 @@ import hmac
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -23,7 +24,8 @@ import requests
 
 from .couriers import detect_courier, normalize_resi
 from .models import (ST_DELIVERED, ST_FAILED, ST_OUT, ST_PENDING, ST_RETURNED, ST_TRANSIT, TrackEvent,
-                     TrackingError, TrackResult, merge_products, parse_idr)
+                     TrackingError, TrackResult, infer_date_from_order_sn, is_masked_blank,
+                     merge_products, parse_idr)
 
 HOST_LIVE = "https://partner.shopeemobile.com"
 HOST_TEST = "https://partner.test-stable.shopeemobile.com"
@@ -206,22 +208,30 @@ class ShopeeClient:
             raise ShopeeError(f"{data.get('error')}: {data.get('message')}")
         return data.get("response") or {}
 
-    def order_list(self, days: int = 15) -> list[str]:
+    def order_list(self, days: int = 15, time_range_field: str = "create_time",
+                   since_ts: int | None = None, until_ts: int | None = None) -> list[str]:
         now = int(time.time())
-        start = now - days * 86400
+        end = min(int(until_ts), now) if until_ts is not None else now
+        start = int(since_ts) if since_ts is not None else (end - days * 86400)
+        if start >= end:
+            start = max(0, end - 60)
         sns: list[str] = []
+        seen: set[str] = set()
         win_from = start
-        while win_from < now:                       # API allows max 15-day windows
-            win_to = min(win_from + 15 * 86400 - 1, now)
+        while win_from < end:                       # API allows max 15-day windows
+            win_to = min(win_from + 15 * 86400 - 1, end)
             cursor = ""
             while True:
                 resp = self.get("/api/v2/order/get_order_list", {
-                    "time_range_field": "create_time", "time_from": win_from, "time_to": win_to,
+                    "time_range_field": time_range_field, "time_from": win_from, "time_to": win_to,
                     "page_size": 100, "cursor": cursor,
                     "response_optional_fields": "order_status"})
                 for o in resp.get("order_list", []):
                     if o.get("order_status", "SHIPPED") in TRACKABLE_ORDER_STATUS:
-                        sns.append(o["order_sn"])
+                        sn = o.get("order_sn") or ""
+                        if sn and sn not in seen:
+                            seen.add(sn)
+                            sns.append(sn)
                 if not resp.get("more"):
                     break
                 cursor = resp.get("next_cursor", "")
@@ -235,9 +245,18 @@ class ShopeeClient:
                 "order_sn_list": ",".join(order_sns[i:i + 50]),
                 "response_optional_fields": "buyer_username,shipping_carrier,recipient_address,item_list,"
                                             "package_list,note,order_status,cancel_by,cancel_reason,buyer_cancel_reason,"
-                                            "payment_method,total_amount,cod,actual_shipping_fee,estimated_shipping_fee"})
+                                            "payment_method,total_amount,cod,actual_shipping_fee,estimated_shipping_fee,"
+                                            "message_to_seller,reverse_shipping_fee"})
             out.extend(resp.get("order_list", []))
         return out
+
+    def escrow_detail(self, order_sn: str) -> dict:
+        if not self.authorised() or not order_sn:
+            return {}
+        try:
+            return self.get("/api/v2/payment/get_escrow_detail", {"order_sn": order_sn})
+        except TrackingError:
+            return {}
 
     def tracking_number(self, order_sn: str, package_number: str = "") -> str:
         p = {"order_sn": order_sn}
@@ -268,14 +287,36 @@ class ShopeeClient:
         return res
 
     # ------------------------------------------------------------------ high level
-    def sync(self, days: int = 15, progress=None) -> list[dict]:
-        """Fetch shipped orders and return shipment records (resi + buyer username)."""
-        sns = self.order_list(days)
+    def sync(self, days: int = 15, progress=None, since_ts: int | None = None,
+             until_ts: int | None = None, time_range_field: str = "create_time") -> list[dict]:
+        """Fetch shipped/updated orders and return shipment records (resi + buyer username + escrow)."""
+        sns = self.order_list(days=days, time_range_field=time_range_field, since_ts=since_ts, until_ts=until_ts)
+        if not sns:
+            return []
         if progress:
             progress(f"{len(sns)} pesanan ditemukan, mengambil detail...")
+        orders = self.order_details(sns)
+
+        escrow_map: dict[str, dict] = {}
+        order_sns = [o["order_sn"] for o in orders if o.get("order_sn")]
+        if order_sns and self.authorised():
+            if progress:
+                progress(f"Mengambil rincian biaya {len(order_sns)} pesanan...")
+            if len(order_sns) == 1:
+                escrow_map[order_sns[0]] = self.escrow_detail(order_sns[0])
+            else:
+                with ThreadPoolExecutor(max_workers=4) as ex:
+                    for sn_k, esc_val in zip(order_sns, ex.map(self.escrow_detail, order_sns)):
+                        escrow_map[sn_k] = esc_val
+
         records: list[dict] = []
-        for o in self.order_details(sns):
+        for o in orders:
             sn = o["order_sn"]
+            try:
+                c_ts = int(o.get("create_time") or 0)
+            except (TypeError, ValueError):
+                c_ts = 0
+            order_date = datetime.fromtimestamp(c_ts).strftime("%Y-%m-%d %H:%M") if c_ts > 0 else infer_date_from_order_sn(sn)
             ord_st = o.get("order_status", "")
             cancel_by = o.get("cancel_by", "") or ""
             cancel_reason = o.get("buyer_cancel_reason") or o.get("cancel_reason") or ""
@@ -289,6 +330,16 @@ class ShopeeClient:
             carrier = o.get("shipping_carrier", "")
             packages = o.get("package_list") or [{}]
             addr = o.get("recipient_address") or {}
+            rec_name = "" if is_masked_blank(addr.get("name", "")) else (addr.get("name") or "").strip()
+            rec_phone = "" if is_masked_blank(addr.get("phone", "")) else (addr.get("phone") or "").strip()
+            raw_city = (addr.get("city") or "").strip()
+            raw_state = (addr.get("state") or "").strip()
+            if is_masked_blank(raw_city):
+                raw_city = ""
+            if is_masked_blank(raw_state):
+                raw_state = ""
+            city_val = f"{raw_city}, {raw_state}" if (raw_city and raw_state and raw_state.lower() not in raw_city.lower()) else (raw_city or raw_state)
+
             items = ""
             item_sub = 0
             for it in o.get("item_list", []):
@@ -301,13 +352,59 @@ class ShopeeClient:
                 else:
                     entry = f"{name}{' x' + str(qty) if qty > 1 else ''}"
                 items = merge_products(items, entry)
-            ship_est = parse_idr(o.get("actual_shipping_fee") or o.get("estimated_shipping_fee"))
+
+            esc = escrow_map.get(sn) or {}
+            bpi = esc.get("buyer_payment_info") or {}
+            oi = esc.get("order_income") or {}
+            if tp <= 0:
+                tp = parse_idr(bpi.get("buyer_total_amount") or oi.get("buyer_total_amount"))
+
+            ship_est = parse_idr(o.get("actual_shipping_fee") or o.get("estimated_shipping_fee") or oi.get("actual_shipping_fee") or oi.get("estimated_shipping_fee"))
             fee_map: dict[str, int] = {}
-            if item_sub > 0:
-                fee_map["product_subtotal"] = item_sub
+            sub_val = parse_idr(bpi.get("merchant_subtotal") or oi.get("order_discounted_price")) or item_sub
+            if sub_val > 0:
+                fee_map["product_subtotal"] = sub_val
+            b_ship = parse_idr(bpi.get("shipping_fee"))
+            if b_ship > 0:
+                fee_map["buyer_shipping"] = b_ship
             if ship_est > 0:
                 fee_map["shipping_est"] = ship_est
+            s_disc = parse_idr(oi.get("shopee_shipping_rebate"))
+            if s_disc > 0:
+                fee_map["shipping_discount"] = s_disc
+            s_vouch = abs(int(bpi.get("seller_voucher") or 0)) or parse_idr(oi.get("voucher_from_seller"))
+            if s_vouch > 0:
+                fee_map["seller_voucher"] = s_vouch
+            sh_vouch = abs(int(bpi.get("shopee_voucher") or 0)) or parse_idr(oi.get("voucher_from_shopee"))
+            if sh_vouch > 0:
+                fee_map["shopee_voucher"] = sh_vouch
+            coin_v = abs(int(bpi.get("shopee_coins_redeemed") or 0))
+            if coin_v > 0:
+                fee_map["coins_discount"] = coin_v
+            cc_v = abs(int(bpi.get("credit_card_promotion") or 0))
+            if cc_v > 0:
+                fee_map["cc_discount"] = cc_v
+            svc_v = parse_idr(bpi.get("buyer_service_fee") or oi.get("buyer_transaction_fee"))
+            if svc_v > 0:
+                fee_map["service_fee"] = svc_v
+            ret_v = parse_idr(o.get("reverse_shipping_fee"))
+            if ret_v > 0:
+                fee_map["return_shipping"] = ret_v
+            seller_fees = (
+                parse_idr(oi.get("commission_fee"))
+                + parse_idr(oi.get("service_fee"))
+                + parse_idr(oi.get("seller_order_processing_fee"))
+                + parse_idr(oi.get("withholding_tax"))
+            )
+            if seller_fees > 0:
+                fee_map["seller_fees"] = seller_fees
+            escrow_amt = parse_idr(oi.get("escrow_amount_after_adjustment") or oi.get("escrow_amount"))
+            if escrow_amt > 0:
+                fee_map["escrow_amount"] = escrow_amt
+
             pay_details = json.dumps(fee_map, ensure_ascii=False) if fee_map else "{}"
+            user_note = (o.get("message_to_seller") or o.get("note") or "").strip()
+
             for pkg in packages:
                 pn = pkg.get("package_number", "")
                 try:
@@ -319,14 +416,16 @@ class ShopeeClient:
                         resi = f"ORDER-{sn}"
                     else:
                         continue
+                pkg_note = user_note or (f"pkg:{pn}" if pn and len(packages) > 1 else "")
                 records.append({
                     "resi": resi,
                     "courier": detect_courier(resi, pkg.get("shipping_carrier") or carrier),
                     "order_sn": sn,
+                    "order_date": order_date,
                     "buyer_username": o.get("buyer_username", ""),
-                    "recipient_name": addr.get("name", ""),
-                    "recipient_phone": addr.get("phone", ""),
-                    "city": addr.get("city", ""),
+                    "recipient_name": rec_name,
+                    "recipient_phone": rec_phone,
+                    "city": city_val,
                     "product": items,
                     "order_source": "shopee_api",
                     "order_status": ord_st,
@@ -335,6 +434,6 @@ class ShopeeClient:
                     "payment_method": pm,
                     "total_payment": tp,
                     "payment_details_json": pay_details,
-                    "note": f"pkg:{pn}" if pn and len(packages) > 1 else "",
+                    "note": pkg_note,
                 })
         return records

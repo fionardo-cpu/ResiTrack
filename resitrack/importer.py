@@ -13,7 +13,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from .couriers import detect_courier, normalize_resi
-from .models import merge_products, parse_idr
+from .models import infer_date_from_order_sn, merge_products, parse_date_str, parse_idr
 
 # Header name mappings (case-insensitive, priority order within each list)
 ALIASES: dict[str, list[str]] = {
@@ -25,6 +25,11 @@ ALIASES: dict[str, list[str]] = {
     "order_sn": [
         "no. pesanan", "no pesanan", "nomor pesanan", "order id", "order_sn",
         "order sn", "no. order", "id pesanan", "order no", "order_id"
+    ],
+    "order_date": [
+        "waktu pesanan dibuat", "tanggal pesanan", "tgl pesanan", "order date",
+        "create time", "create_time", "waktu dibuat", "tanggal dibuat",
+        "waktu pembayaran dilakukan"
     ],
     "buyer_username": [
         "username (pembeli)", "username pembeli", "username", "buyer username",
@@ -548,7 +553,8 @@ def parse_file(path: str | Path) -> tuple[list[dict], list[str]]:
         resi = normalize_resi(raw_resi)
         if resi in ("-", "NONE", "NULL", "NAN", "0"):
             resi = ""
-        order_sn = raw_order_sn if raw_order_sn.upper() not in ("-", "NONE", "NULL", "NAN", "0") else ""
+        raw_sn_clean = raw_order_sn.strip().upper()
+        order_sn = raw_sn_clean if raw_sn_clean not in ("", "-", "NONE", "NULL", "NAN", "0") else ""
 
         if not resi and not order_sn:
             skipped += 1
@@ -571,6 +577,7 @@ def parse_file(path: str | Path) -> tuple[list[dict], list[str]]:
         rec = (by_resi.get(resi) if resi else None) or (by_order_sn.get(order_sn) if order_sn else None) or by_resi.get(effective_resi)
         cancel_reason = g("cancel_reason")
         cancel_by = _infer_cancel_by(g("cancel_by"), cancel_reason)
+        order_date = parse_date_str(g("order_date")) or infer_date_from_order_sn(order_sn)
         payment_method = g("payment_method")
         total_payment = parse_idr(g("total_payment"))
         sub_item = parse_idr(g("subtotal_item"))
@@ -593,6 +600,7 @@ def parse_file(path: str | Path) -> tuple[list[dict], list[str]]:
                 "resi": effective_resi,
                 "courier": courier,
                 "order_sn": order_sn,
+                "order_date": order_date,
                 "buyer_username": g("buyer_username"),
                 "recipient_name": g("recipient_name"),
                 "recipient_phone": g("recipient_phone"),
@@ -626,6 +634,8 @@ def parse_file(path: str | Path) -> tuple[list[dict], list[str]]:
             for fk, fv in order_fee_vals.items():
                 if fv > 0 and not fee_acc.get(fk):
                     fee_acc[fk] = fv
+            if order_date and len(order_date) > len(rec.get("order_date") or ""):
+                rec["order_date"] = order_date
             if payment_method and not rec.get("payment_method"):
                 rec["payment_method"] = payment_method
             if total_payment > 0 and not int(rec.get("total_payment") or 0):
@@ -683,7 +693,7 @@ def write_template(path: str | Path) -> None:
 
 def export_csv(path: str | Path, rows) -> None:
     cols = [
-        "resi", "courier", "order_sn", "buyer_username", "order_status", "status",
+        "resi", "courier", "order_sn", "order_date", "buyer_username", "order_status", "status",
         "payment_method", "total_payment", "cancel_by", "cancel_reason",
         "last_event", "last_event_time", "recipient_name", "city", "product", "last_checked",
         "tracking_source", "note"

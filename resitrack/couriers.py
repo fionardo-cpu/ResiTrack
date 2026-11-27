@@ -24,7 +24,7 @@ from typing import Callable
 import requests
 
 from .models import (ST_DELIVERED, ST_FAILED, ST_OUT, ST_PENDING, ST_RETURNED, ST_TRANSIT, ST_UNKNOWN,
-                     NotFound, TrackEvent, TrackingError, TrackResult, classify)
+                     NotFound, TrackEvent, TrackingError, TrackResult, classify, is_delivered_event)
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/124.0 Safari/537.36 ResiTrack/1.0")
@@ -148,10 +148,7 @@ def track_spx(resi: str) -> TrackResult:
         elif (
             milestone == "delivered"
             or milestone_code == 7
-            or any(
-                k in text
-                for k in ("delivered", "terkirim", "diterima oleh", "diterima di ", "telah diterima", "tiba di alamat tujuan")
-            )
+            or is_delivered_event(desc_low)
         ):
             res.status = ST_DELIVERED
         elif "ditolak pembeli" in desc_low or "akan dikembalikan" in desc_low:

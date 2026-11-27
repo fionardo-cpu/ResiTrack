@@ -37,10 +37,13 @@ from .models import (
     ST_RTS_RETURN,
     ST_UNKNOWN,
     effective_status,
+    format_date_short,
     format_idr,
+    is_masked_blank,
     payment_details_dict,
     payment_short_label,
     row_lifecycle,
+    row_order_date,
 )
 from .theme import courier_style, duplicate_style, get_tokens, payment_style, status_style
 
@@ -510,12 +513,13 @@ class InspectorPanel(QWidget):
         grid.addWidget(k_sn, 0, 0)
         grid.addLayout(sn_wrap, 0, 1)
 
-        _, self._lbl_shop_status = kv_row(1, "Status Shopee")
-        _, self._lbl_recipient = kv_row(2, "Penerima")
-        _, self._lbl_city = kv_row(3, "Tujuan")
-        _, self._lbl_product = kv_row(4, "Produk")
-        self._k_cancel, self._lbl_cancel = kv_row(5, "Alasan Batal")
-        self._k_note, self._lbl_note = kv_row(6, "Catatan")
+        self._k_order_date, self._lbl_order_date = kv_row(1, "Tgl Pesanan")
+        _, self._lbl_shop_status = kv_row(2, "Status Shopee")
+        _, self._lbl_recipient = kv_row(3, "Penerima")
+        _, self._lbl_city = kv_row(4, "Tujuan")
+        _, self._lbl_product = kv_row(5, "Produk")
+        self._k_cancel, self._lbl_cancel = kv_row(6, "Alasan Batal")
+        self._k_note, self._lbl_note = kv_row(7, "Catatan")
 
         oc_lay.addLayout(grid)
         b_lay.addWidget(self._order_card)
@@ -787,13 +791,43 @@ class InspectorPanel(QWidget):
         self._lbl_buyer.setText(buyer)
         self._btn_copy_buyer.setVisible(bool(r.get("buyer_username")))
 
+        rec_name = (r.get("recipient_name") or "").strip()
+        phone = (r.get("recipient_phone") or "").strip()
+        is_api = (r.get("order_source") or "").strip() == "shopee_api"
+        if is_masked_blank(rec_name):
+            rec_name = ""
+        if is_masked_blank(phone):
+            phone = ""
+        rec_display = f"{rec_name} ({phone})" if (rec_name and phone) else (rec_name or phone)
+        self._lbl_buyer_sub.setText(rec_display if rec_display else "Pembeli Shopee")
+
         self._lbl_ordersn.setText(r.get("order_sn") or "-")
         self._btn_copy_sn.setVisible(bool(r.get("order_sn")))
+        od = row_order_date(r)
+        if od is not None:
+            od_str = format_date_short(od)
+            raw_od = str(r.get("order_date") or "").strip()
+            if " " in raw_od and len(raw_od) >= 16:
+                od_str = f"{od_str}, {raw_od[11:16]}"
+            self._lbl_order_date.setText(od_str)
+            self._k_order_date.show()
+            self._lbl_order_date.show()
+        else:
+            self._k_order_date.hide()
+            self._lbl_order_date.hide()
         self._lbl_shop_status.setText(r.get("order_status") or "-")
-        rec_name = r.get("recipient_name") or "-"
-        phone = r.get("recipient_phone") or ""
-        self._lbl_recipient.setText(f"{rec_name} ({phone})" if phone else rec_name)
-        self._lbl_city.setText(r.get("city") or "-")
+        if rec_display:
+            self._lbl_recipient.setText(rec_display)
+        elif is_api:
+            self._lbl_recipient.setText("Disensor Shopee API (impor Excel untuk isi)")
+        else:
+            self._lbl_recipient.setText("-")
+
+        raw_city = (r.get("city") or "").strip()
+        if is_masked_blank(raw_city):
+            self._lbl_city.setText("Disensor Shopee API" if is_api else "-")
+        else:
+            self._lbl_city.setText(raw_city)
         self._lbl_product.setText(r.get("product") or "-")
 
         c_by = (r.get("cancel_by") or "").strip()
@@ -885,6 +919,8 @@ class InspectorPanel(QWidget):
         cc = details.get("cc_discount", 0)
         svc = details.get("service_fee", 0)
         ret_s = details.get("return_shipping", 0)
+        seller_fees = details.get("seller_fees", 0)
+        escrow_amt = details.get("escrow_amount", 0)
 
         fee_rows: list[tuple[str, str, str]] = []
         if sub > 0:
@@ -905,6 +941,10 @@ class InspectorPanel(QWidget):
             fee_rows.append(("Biaya Layanan", format_idr(svc), "normal"))
         if ret_s > 0:
             fee_rows.append(("Ongkir Retur", format_idr(ret_s), "warn"))
+        if seller_fees > 0:
+            fee_rows.append(("Biaya Admin Penjual", f"-{format_idr(seller_fees)}", "warn"))
+        if escrow_amt > 0:
+            fee_rows.append(("Dana Cair Penjual", format_idr(escrow_amt), "discount"))
         if not fee_rows and s_est > 0:
             fee_rows.append(("Perkiraan Ongkir", format_idr(s_est), "normal"))
 

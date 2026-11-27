@@ -1,13 +1,17 @@
 """Modern Minimalist 3-Column ResiTrack Desktop Workspace (Alabaster & Ink / Obsidian & Mist)."""
 from __future__ import annotations
 
+import time
 import webbrowser
 from collections import Counter
+from datetime import date, datetime
 from pathlib import Path
 
 from PySide6.QtCore import (
+    QDate,
     QItemSelection,
     QItemSelectionModel,
+    QPoint,
     QRect,
     QSortFilterProxyModel,
     Qt,
@@ -17,6 +21,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QColor,
+    QCursor,
     QDragEnterEvent,
     QDropEvent,
     QFont,
@@ -35,6 +40,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
+    QDateEdit,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -48,6 +54,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QStackedWidget,
     QStyle,
@@ -60,7 +67,7 @@ from PySide6.QtWidgets import (
 from . import __version__, importer
 from .config import assets_dir, load_settings, save_settings
 from .db import DB
-from .dialogs import AddDialog, SettingsDialog
+from .dialogs import AddDialog, SettingsDialog, ShopeeSyncDialog
 from .icons import svg_icon, svg_pixmap
 from .inspector import InspectorPanel
 from .models import (
@@ -85,11 +92,15 @@ from .models import (
     ST_UNKNOWN,
     duplicate_resi_map,
     effective_status,
+    format_date_short,
     format_idr,
     is_cod_payment,
+    is_masked_blank,
     payment_short_label,
     recipient_dup_key,
+    resolve_date_range,
     row_lifecycle,
+    row_order_date,
 )
 from .shopee_api import ShopeeClient
 from .theme import (
@@ -162,6 +173,20 @@ class _BaseRowDelegate(QStyledItemDelegate):
 
 
 class BuyerCellDelegate(_BaseRowDelegate):
+    @staticmethod
+    def sub_text(row_dict: dict) -> tuple[str, bool]:
+        """Return (subtitle_text, is_recipient) so recipient name & phone always appear under buyer username."""
+        rec_name = (row_dict.get("recipient_name") or "").strip()
+        rec_phone = (row_dict.get("recipient_phone") or "").strip()
+        if is_masked_blank(rec_name):
+            rec_name = ""
+        if is_masked_blank(rec_phone):
+            rec_phone = ""
+        if rec_name or rec_phone:
+            txt = f"{rec_name} ({rec_phone})" if (rec_name and rec_phone) else (rec_name or rec_phone)
+            return txt, True
+        return ((row_dict.get("order_sn") or "").strip() or "-", False)
+
     def paint(self, painter: QPainter, option, index):
         painter.save()
         self._paint_row_bg(painter, option, index, draw_left_bar=True)
@@ -170,15 +195,7 @@ class BuyerCellDelegate(_BaseRowDelegate):
 
         r = option.rect.adjusted(16, 10, -10, -10)
         buyer = (d.get("buyer_username") or "").strip() or "Tanpa Username"
-        if getattr(self._table, "duplicate_view_mode", False):
-            rec_name = (d.get("recipient_name") or "").strip()
-            rec_phone = (d.get("recipient_phone") or "").strip()
-            if rec_name or rec_phone:
-                sub_txt = f"{rec_name} ({rec_phone})" if (rec_name and rec_phone) else (rec_name or rec_phone)
-            else:
-                sub_txt = (d.get("order_sn") or "").strip() or "-"
-        else:
-            sub_txt = (d.get("order_sn") or "").strip() or "-"
+        sub_txt, is_rec = self.sub_text(d)
 
         f_top = QFont(option.font)
         f_top.setPointSize(10)
@@ -189,7 +206,11 @@ class BuyerCellDelegate(_BaseRowDelegate):
         painter.drawText(r.left(), r.top(), r.width(), 20, Qt.AlignLeft | Qt.AlignVCenter,
                          fm1.elidedText(buyer, Qt.ElideRight, r.width()))
 
-        f_sub = QFont("Consolas", 8.5)
+        if is_rec:
+            f_sub = QFont(option.font)
+            f_sub.setPointSizeF(8.5)
+        else:
+            f_sub = QFont("Consolas", 8.5)
         painter.setFont(f_sub)
         painter.setPen(QColor(t["text_muted"]))
         fm2 = QFontMetrics(f_sub)
@@ -300,6 +321,36 @@ class ResiCellDelegate(_BaseRowDelegate):
 
 
 class StatusPillDelegate(_BaseRowDelegate):
+    @staticmethod
+    def dup_badge_rect(cell_rect: QRect, row_dict: dict, status: str, base_font: QFont) -> QRect:
+        """Compute exact hit/paint rect for clickable 'Duplikat · Nx' badge inside the Status column."""
+        dup_cnt = int(row_dict.get("_dup_count") or 0)
+        if dup_cnt < 2:
+            return QRect()
+        is_rts = status in RTS_STATUSES
+        pill_h = 24
+        px = cell_rect.left() + 10
+        py = cell_rect.top() + 8
+        x_sub = px + 4
+        y_sub = py + pill_h + 3
+        if is_rts:
+            lc = row_lifecycle(row_dict)
+            lc_lbl = "Selesai" if lc == CAT_FINISHED else "Berjalan"
+            f_sub = QFont(base_font)
+            f_sub.setPointSize(7.5)
+            f_sub.setBold(lc == CAT_ACTIVE)
+            x_sub += QFontMetrics(f_sub).horizontalAdvance(lc_lbl) + 6
+
+        dup_lbl = f"Duplikat · {dup_cnt}x"
+        f_dup = QFont(base_font)
+        f_dup.setPointSize(7.2)
+        f_dup.setBold(True)
+        fm_dup = QFontMetrics(f_dup)
+        dw = min(max(44, cell_rect.right() - 6 - x_sub), fm_dup.horizontalAdvance(dup_lbl) + 10)
+        if dw < 44:
+            return QRect()
+        return QRect(x_sub, y_sub, dw, 15)
+
     def paint(self, painter: QPainter, option, index):
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing)
@@ -344,38 +395,35 @@ class StatusPillDelegate(_BaseRowDelegate):
                          fm.elidedText(short_lbl, Qt.ElideRight, txt_rect.width()))
 
         if two_line:
-            x_sub = px + 4
-            y_sub = py + pill_h + 3
             if is_rts:
+                x_sub = px + 4
+                y_sub = py + pill_h + 3
                 lc = row_lifecycle(d)
                 lc_lbl = "Selesai" if lc == CAT_FINISHED else "Berjalan"
                 f_sub = QFont(option.font)
                 f_sub.setPointSize(7.5)
                 f_sub.setBold(lc == CAT_ACTIVE)
-                fm_sub = QFontMetrics(f_sub)
                 painter.setFont(f_sub)
                 painter.setPen(QColor(t["text_muted"] if lc == CAT_FINISHED else t["text_secondary"]))
                 painter.drawText(x_sub, y_sub, option.rect.width() - 16, 15,
                                  Qt.AlignLeft | Qt.AlignVCenter, lc_lbl)
-                x_sub += fm_sub.horizontalAdvance(lc_lbl) + 6
 
-            if is_dup:
+            dup_rect = self.dup_badge_rect(option.rect, d, status, option.font)
+            if not dup_rect.isEmpty():
                 dup_lbl = f"Duplikat · {dup_cnt}x"
                 d_bg, d_fg = duplicate_style(self.is_dark)
                 f_dup = QFont(option.font)
                 f_dup.setPointSize(7.2)
                 f_dup.setBold(True)
                 fm_dup = QFontMetrics(f_dup)
-                dw = min(max(44, option.rect.right() - 6 - x_sub), fm_dup.horizontalAdvance(dup_lbl) + 10)
-                if dw >= 44:
-                    dup_rect = QRect(x_sub, y_sub, dw, 15)
-                    painter.setBrush(QColor(d_bg))
-                    painter.setPen(Qt.NoPen)
-                    painter.drawRoundedRect(dup_rect, 4, 4)
-                    painter.setFont(f_dup)
-                    painter.setPen(QColor(d_fg))
-                    painter.drawText(dup_rect, Qt.AlignCenter,
-                                     fm_dup.elidedText(dup_lbl, Qt.ElideRight, dw - 6))
+                is_dup_hover = (getattr(self._table, "hovered_dup_row", -1) == index.row())
+                painter.setBrush(QColor(d_bg))
+                painter.setPen(QPen(QColor(d_fg), 1.0) if is_dup_hover else Qt.NoPen)
+                painter.drawRoundedRect(dup_rect, 4, 4)
+                painter.setFont(f_dup)
+                painter.setPen(QColor(d_fg))
+                painter.drawText(dup_rect, Qt.AlignCenter,
+                                 fm_dup.elidedText(dup_lbl, Qt.ElideRight, dup_rect.width() - 6))
         painter.restore()
 
 
@@ -443,14 +491,16 @@ class EventCellDelegate(_BaseRowDelegate):
 
 
 class HoverTableView(QTableView):
-    """QTableView subclass tracking full-row hover and inline copy-resi icon hits."""
+    """QTableView subclass tracking full-row hover, inline copy-resi icons, and duplicate badges."""
 
     copy_resi_requested = Signal(str)
+    duplicate_badge_clicked = Signal(str, QPoint)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.hovered_row = -1
         self.hovered_copy_row = -1
+        self.hovered_dup_row = -1
         self.copied_resi = ""
         self.duplicate_view_mode = False
         self.setMouseTracking(True)
@@ -465,6 +515,20 @@ class HoverTableView(QTableView):
         if not btn_rect.isEmpty() and btn_rect.contains(pos):
             return idx.row(), resi
         return -1, ""
+
+    def _hit_dup_badge(self, pos) -> tuple[int, str, QRect]:
+        idx = self.indexAt(pos)
+        if not idx.isValid() or idx.column() != COL["status"]:
+            return -1, "", QRect()
+        d = self.model().index(idx.row(), 0).data(ROW_DATA_ROLE)
+        if not isinstance(d, dict):
+            return -1, "", QRect()
+        resi = d.get("resi") or ""
+        status = idx.data(Qt.DisplayRole) or effective_status(d)
+        dup_rect = StatusPillDelegate.dup_badge_rect(self.visualRect(idx), d, status, self.font())
+        if not dup_rect.isEmpty() and dup_rect.adjusted(-2, -2, 2, 2).contains(pos):
+            return idx.row(), resi, dup_rect
+        return -1, "", QRect()
 
     def flash_copied_resi(self, resi: str) -> None:
         self.copied_resi = resi
@@ -485,27 +549,48 @@ class HoverTableView(QTableView):
         idx = self.indexAt(pos)
         new_row = idx.row() if idx.isValid() else -1
         copy_row, _resi = self._hit_copy_resi(pos)
-        changed = (new_row != self.hovered_row) or (copy_row != self.hovered_copy_row)
+        dup_row, _dresi, _drect = self._hit_dup_badge(pos)
+        changed = (
+            (new_row != self.hovered_row)
+            or (copy_row != self.hovered_copy_row)
+            or (dup_row != self.hovered_dup_row)
+        )
         self.hovered_row = new_row
         self.hovered_copy_row = copy_row
-        self.viewport().setCursor(Qt.PointingHandCursor if copy_row != -1 else Qt.ArrowCursor)
+        self.hovered_dup_row = dup_row
+        self.viewport().setCursor(
+            Qt.PointingHandCursor if (copy_row != -1 or dup_row != -1) else Qt.ArrowCursor
+        )
         if changed:
             self.viewport().update()
         super().mouseMoveEvent(event)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            copy_row, resi = self._hit_copy_resi(event.position().toPoint())
+            pos = event.position().toPoint()
+            copy_row, resi = self._hit_copy_resi(pos)
             if copy_row != -1 and resi:
                 self.copy_resi_requested.emit(resi)
+                event.accept()
+                return
+            dup_row, dup_resi, dup_rect = self._hit_dup_badge(pos)
+            if dup_row != -1 and dup_resi:
+                self.duplicate_badge_clicked.emit(
+                    dup_resi, self.viewport().mapToGlobal(dup_rect.bottomLeft())
+                )
                 event.accept()
                 return
         super().mousePressEvent(event)
 
     def leaveEvent(self, event):
-        changed = (self.hovered_row != -1) or (self.hovered_copy_row != -1)
+        changed = (
+            (self.hovered_row != -1)
+            or (self.hovered_copy_row != -1)
+            or (self.hovered_dup_row != -1)
+        )
         self.hovered_row = -1
         self.hovered_copy_row = -1
+        self.hovered_dup_row = -1
         self.viewport().setCursor(Qt.ArrowCursor)
         if changed:
             self.viewport().update()
@@ -540,6 +625,19 @@ _FILTER_STATUS_ITEMS: list[tuple[str, str]] = [
 _FILTER_STATUS_LABELS = dict(_FILTER_STATUS_ITEMS)
 
 
+_DATE_PRESET_ITEMS: list[tuple[str, str]] = [
+    ("", "Semua"),
+    ("today", "Hari Ini"),
+    ("yesterday", "Kemarin"),
+    ("this_week", "Minggu Ini"),
+    ("last_7d", "7 Hari"),
+    ("this_month", "Bulan Ini"),
+    ("last_month", "Bulan Lalu"),
+    ("custom", "Rentang..."),
+]
+_DATE_PRESET_LABELS = dict(_DATE_PRESET_ITEMS)
+
+
 class FilterProxy(QSortFilterProxyModel):
     def __init__(self):
         super().__init__()
@@ -548,12 +646,18 @@ class FilterProxy(QSortFilterProxyModel):
         self.status = ""
         self.duplicates_only = False
         self.duplicate_resis: set[str] = set()
-        self.checked_lifecycles: set[str] = set()
-        self.status_mode: str = "include"
-        self.checked_statuses: set[str] = set()
-        self.checked_couriers: set[str] = set()
-        self.checked_payments: set[str] = set()
+        self.dup_group_resis: set[str] = set()
+        self.lifecycles_inc: set[str] = set()
+        self.lifecycles_exc: set[str] = set()
+        self.statuses_inc: set[str] = set()
+        self.statuses_exc: set[str] = set()
+        self.couriers_inc: set[str] = set()
+        self.couriers_exc: set[str] = set()
+        self.payments_inc: set[str] = set()
+        self.payments_exc: set[str] = set()
         self.dup_filter: str = ""
+        self.date_from: date | None = None
+        self.date_to: date | None = None
 
     def filterAcceptsRow(self, row, parent):
         d = self.sourceModel().index(row, 0, parent).data(ROW_DATA_ROLE)
@@ -563,8 +667,13 @@ class FilterProxy(QSortFilterProxyModel):
         resi_val = d.get("resi") or ""
         row_status = effective_status(d)
         row_lc = row_lifecycle(d)
+        row_courier = (d.get("courier") or "").upper()
+        row_pay = _payment_filter_bucket(d.get("payment_method") or "")
 
-        # 1. Primary view filter (Sidebar)
+        # 1. Primary view filter (Sidebar / Dup Group)
+        if self.dup_group_resis and resi_val not in self.dup_group_resis:
+            return False
+
         if self.duplicates_only:
             if resi_val not in self.duplicate_resis:
                 return False
@@ -574,24 +683,36 @@ class FilterProxy(QSortFilterProxyModel):
             if self.category and row_lc != self.category:
                 return False
 
-        # 2. Multi-select checklist filters (Workspace Filter Popover)
-        if self.checked_lifecycles and row_lc not in self.checked_lifecycles:
+        # 2. Date range filter (Order Date)
+        if self.date_from is not None or self.date_to is not None:
+            od = row_order_date(d)
+            if od is None:
+                return False
+            if self.date_from is not None and od < self.date_from:
+                return False
+            if self.date_to is not None and od > self.date_to:
+                return False
+
+        # 3. Simultaneous Tampilkan (Include) + Kecualikan (Exclude) across all dimensions
+        if self.lifecycles_inc and row_lc not in self.lifecycles_inc:
+            return False
+        if self.lifecycles_exc and row_lc in self.lifecycles_exc:
             return False
 
-        if self.checked_statuses:
-            if self.status_mode == "exclude":
-                if row_status in self.checked_statuses:
-                    return False
-            elif row_status not in self.checked_statuses:
-                return False
+        if self.statuses_inc and row_status not in self.statuses_inc:
+            return False
+        if self.statuses_exc and row_status in self.statuses_exc:
+            return False
 
-        if self.checked_couriers:
-            if (d.get("courier") or "").upper() not in self.checked_couriers:
-                return False
+        if self.couriers_inc and row_courier not in self.couriers_inc:
+            return False
+        if self.couriers_exc and row_courier in self.couriers_exc:
+            return False
 
-        if self.checked_payments:
-            if _payment_filter_bucket(d.get("payment_method") or "") not in self.checked_payments:
-                return False
+        if self.payments_inc and row_pay not in self.payments_inc:
+            return False
+        if self.payments_exc and row_pay in self.payments_exc:
+            return False
 
         if self.dup_filter == "only":
             if resi_val not in self.duplicate_resis:
@@ -600,7 +721,7 @@ class FilterProxy(QSortFilterProxyModel):
             if resi_val in self.duplicate_resis:
                 return False
 
-        # 3. Search box
+        # 4. Search box
         if self.text:
             q = self.text.lower()
             hay = " ".join(
@@ -618,125 +739,249 @@ class FilterProxy(QSortFilterProxyModel):
         return True
 
 
+class _DualFilterChip(QPushButton):
+    """Minimalist 3-state chip: Left-click cycles Off -> ✓ Include -> ✕ Exclude -> Off."""
+
+    mode_changed = Signal()
+
+    def __init__(self, label: str, parent=None):
+        super().__init__(label, parent)
+        self.base_label = label
+        self.filter_mode = ""  # "" | "include" | "exclude"
+        self.setObjectName("DualFilterChip")
+        self.setCheckable(True)
+        self.setProperty("mode", "off")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("Klik 1× tampilkan · 2× kecualikan · 3× hapus")
+        self.clicked.connect(self._on_left_clicked)
+
+    def _on_left_clicked(self) -> None:
+        cycle = {"": "include", "include": "exclude", "exclude": ""}
+        self.set_filter_mode(cycle.get(self.filter_mode, ""), emit=True)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.RightButton:
+            new_mode = "" if self.filter_mode == "exclude" else "exclude"
+            self.set_filter_mode(new_mode, emit=True)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def set_filter_mode(self, mode: str, emit: bool = False) -> None:
+        mode = mode if mode in ("include", "exclude") else ""
+        changed = (mode != self.filter_mode)
+        self.filter_mode = mode
+        if mode == "include":
+            self.setText(f"✓ {self.base_label}")
+            self.setProperty("mode", "include")
+        elif mode == "exclude":
+            self.setText(f"✕ {self.base_label}")
+            self.setProperty("mode", "exclude")
+        else:
+            self.setText(self.base_label)
+            self.setProperty("mode", "off")
+        super().setChecked(bool(mode))
+        self.style().unpolish(self)
+        self.style().polish(self)
+        if emit and changed:
+            self.mode_changed.emit()
+
+    def setChecked(self, checked: bool) -> None:
+        self.set_filter_mode("include" if checked else "", emit=(not self.signalsBlocked()))
+
+
 class FilterPopover(QFrame):
-    """Minimalist floating multi-select checklist popover (Include / Exclude)."""
+    """Minimalist 3-tab floating filter (Status | Tanggal | Lainnya) with simultaneous ✓/✕."""
 
     filters_changed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint)
         self.setObjectName("FilterPopover")
-        self.setFixedWidth(376)
+        self.setFixedWidth(356)
+        self._date_preset = ""
+        self._anchor_widget: QWidget | None = None
+        self._closed_by_anchor = False
+        self._closed_at = 0.0
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 14, 16, 14)
+        root.setContentsMargins(14, 12, 14, 12)
         root.setSpacing(10)
 
-        # Header + Quick Preset + Reset
+        # 1. Clean Header (Title + Reset)
         hdr = QHBoxLayout()
         hdr.setSpacing(6)
-        title = QLabel("Filter Pesanan")
+        title = QLabel("Filter")
         title.setStyleSheet("font-size: 13px; font-weight: 700;")
-        self._btn_no_canc = QPushButton("Tanpa Canceled")
-        self._btn_no_canc.setObjectName("PresetChip")
-        self._btn_no_canc.setCheckable(True)
-        self._btn_no_canc.setCursor(Qt.PointingHandCursor)
-        self._btn_no_canc.clicked.connect(self.apply_no_canceled_preset)
         btn_reset = QPushButton("Reset")
         btn_reset.setObjectName("GhostBtn")
         btn_reset.setCursor(Qt.PointingHandCursor)
         btn_reset.clicked.connect(self.reset_all)
         hdr.addWidget(title)
         hdr.addStretch(1)
-        hdr.addWidget(self._btn_no_canc)
         hdr.addWidget(btn_reset)
         root.addLayout(hdr)
+
+        # 2. Calm 3-Tab Segmented Switcher
+        tab_bar = QFrame()
+        tab_bar.setObjectName("SegmentedBar")
+        t_lay = QHBoxLayout(tab_bar)
+        t_lay.setContentsMargins(2, 2, 2, 2)
+        t_lay.setSpacing(2)
+
+        def _make_tab(lbl: str, idx: int) -> QPushButton:
+            b = QPushButton(lbl)
+            b.setObjectName("SegBtn")
+            b.setCheckable(True)
+            b.setChecked(idx == 0)
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(lambda _c=False, i=idx: self._set_tab(i))
+            t_lay.addWidget(b, 1)
+            return b
+
+        self._tab_status = _make_tab("Status", 0)
+        self._tab_date = _make_tab("Tanggal", 1)
+        self._tab_other = _make_tab("Lainnya", 2)
+        self._tab_btns = [self._tab_status, self._tab_date, self._tab_other]
+        root.addWidget(tab_bar)
 
         def _over(txt: str) -> QLabel:
             lbl = QLabel(txt)
             lbl.setObjectName("SectionOverline")
             return lbl
 
-        # 1. Kategori
-        root.addWidget(_over("KATEGORI"))
+        # 3. Stacked Tab Pages
+        self._tabs_stack = QStackedWidget()
+        root.addWidget(self._tabs_stack)
+
+        # ---- Page 0: Status
+        pg_status = QWidget()
+        s_lay = QVBoxLayout(pg_status)
+        s_lay.setContentsMargins(0, 2, 0, 0)
+        s_lay.setSpacing(8)
+
+        s_top = QHBoxLayout()
+        s_top.setSpacing(6)
+        self._btn_no_canc = QPushButton("Tanpa Canceled")
+        self._btn_no_canc.setObjectName("PresetChip")
+        self._btn_no_canc.setCheckable(True)
+        self._btn_no_canc.setCursor(Qt.PointingHandCursor)
+        self._btn_no_canc.setToolTip("Kecualikan semua Canceled (Pembeli & Sistem) tanpa menghapus filter lain")
+        self._btn_no_canc.clicked.connect(self.apply_no_canceled_preset)
+        lbl_hint_s = QLabel("1× ✓ · 2× ✕")
+        lbl_hint_s.setObjectName("MutedText")
+        lbl_hint_s.setStyleSheet("font-size: 10.5px;")
+        s_top.addWidget(self._btn_no_canc)
+        s_top.addStretch(1)
+        s_top.addWidget(lbl_hint_s)
+        s_lay.addLayout(s_top)
+
+        st_grid = QGridLayout()
+        st_grid.setHorizontalSpacing(4)
+        st_grid.setVerticalSpacing(3)
+        self._st_checks: dict[str, _DualFilterChip] = {}
+        for idx, (st_key, lbl) in enumerate(_FILTER_STATUS_ITEMS):
+            cb = _DualFilterChip(lbl)
+            cb.mode_changed.connect(self._on_changed)
+            self._st_checks[st_key] = cb
+            st_grid.addWidget(cb, idx // 2, idx % 2)
+        s_lay.addLayout(st_grid)
+        s_lay.addStretch(1)
+        self._tabs_stack.addWidget(pg_status)
+
+        # ---- Page 1: Tanggal Pesanan
+        pg_date = QWidget()
+        d_lay = QVBoxLayout(pg_date)
+        d_lay.setContentsMargins(0, 2, 0, 0)
+        d_lay.setSpacing(10)
+
+        dt_grid = QGridLayout()
+        dt_grid.setHorizontalSpacing(6)
+        dt_grid.setVerticalSpacing(6)
+        self._date_btns: dict[str, QPushButton] = {}
+        for idx, (dk, dlbl) in enumerate(_DATE_PRESET_ITEMS):
+            b = QPushButton(dlbl)
+            b.setObjectName("PresetChip")
+            b.setCheckable(True)
+            b.setChecked(dk == "")
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(lambda _c=False, p=dk: self._set_date_preset(p))
+            self._date_btns[dk] = b
+            dt_grid.addWidget(b, idx // 2, idx % 2)
+        d_lay.addLayout(dt_grid)
+
+        self._date_range_row = QWidget()
+        dr_lay = QHBoxLayout(self._date_range_row)
+        dr_lay.setContentsMargins(0, 2, 0, 0)
+        dr_lay.setSpacing(6)
+        today_qd = QDate.currentDate()
+        month_start_qd = QDate(today_qd.year(), today_qd.month(), 1)
+        self._dt_from = QDateEdit(month_start_qd)
+        self._dt_from.setCalendarPopup(True)
+        self._dt_from.setDisplayFormat("dd/MM/yyyy")
+        self._dt_to = QDateEdit(today_qd)
+        self._dt_to.setCalendarPopup(True)
+        self._dt_to.setDisplayFormat("dd/MM/yyyy")
+        self._dt_from.dateChanged.connect(self._on_custom_date_changed)
+        self._dt_to.dateChanged.connect(self._on_custom_date_changed)
+        lbl_sd = QLabel("s/d")
+        lbl_sd.setObjectName("MutedText")
+        lbl_sd.setStyleSheet("font-size: 11px;")
+        dr_lay.addWidget(self._dt_from, 1)
+        dr_lay.addWidget(lbl_sd)
+        dr_lay.addWidget(self._dt_to, 1)
+        self._date_range_row.hide()
+        d_lay.addWidget(self._date_range_row)
+        d_lay.addStretch(1)
+        self._tabs_stack.addWidget(pg_date)
+
+        # ---- Page 2: Lainnya (Kategori, Kurir, Pembayaran, Duplikat)
+        pg_other = QWidget()
+        o_lay = QVBoxLayout(pg_other)
+        o_lay.setContentsMargins(0, 2, 0, 0)
+        o_lay.setSpacing(7)
+
+        o_lay.addWidget(_over("KATEGORI"))
         lc_row = QHBoxLayout()
-        lc_row.setSpacing(12)
-        self._lc_checks: dict[str, QCheckBox] = {}
+        lc_row.setSpacing(4)
+        self._lc_checks: dict[str, _DualFilterChip] = {}
         for k, lbl in ((CAT_ACTIVE, "Berjalan"), (CAT_FINISHED, "Selesai"), (CAT_OTHER, "Lainnya")):
-            cb = QCheckBox(lbl)
-            cb.setCursor(Qt.PointingHandCursor)
-            cb.toggled.connect(self._on_changed)
+            cb = _DualFilterChip(lbl)
+            cb.mode_changed.connect(self._on_changed)
             self._lc_checks[k] = cb
             lc_row.addWidget(cb)
         lc_row.addStretch(1)
-        root.addLayout(lc_row)
+        o_lay.addLayout(lc_row)
 
-        # 2. Status + Tampilkan / Kecualikan mode
-        st_hdr = QHBoxLayout()
-        st_hdr.setSpacing(6)
-        st_hdr.addWidget(_over("STATUS"))
-        st_hdr.addStretch(1)
-        self._btn_inc = QPushButton("Tampilkan")
-        self._btn_inc.setObjectName("PresetChip")
-        self._btn_inc.setCheckable(True)
-        self._btn_inc.setChecked(True)
-        self._btn_inc.setCursor(Qt.PointingHandCursor)
-        self._btn_exc = QPushButton("Kecualikan")
-        self._btn_exc.setObjectName("PresetChip")
-        self._btn_exc.setCheckable(True)
-        self._btn_exc.setCursor(Qt.PointingHandCursor)
-        self._btn_inc.clicked.connect(lambda: self._set_status_mode("include"))
-        self._btn_exc.clicked.connect(lambda: self._set_status_mode("exclude"))
-        st_hdr.addWidget(self._btn_inc)
-        st_hdr.addWidget(self._btn_exc)
-        root.addLayout(st_hdr)
-
-        st_grid = QGridLayout()
-        st_grid.setHorizontalSpacing(10)
-        st_grid.setVerticalSpacing(5)
-        self._st_checks: dict[str, QCheckBox] = {}
-        for idx, (st_key, lbl) in enumerate(_FILTER_STATUS_ITEMS):
-            cb = QCheckBox(lbl)
-            cb.setCursor(Qt.PointingHandCursor)
-            cb.toggled.connect(self._on_changed)
-            self._st_checks[st_key] = cb
-            st_grid.addWidget(cb, idx // 2, idx % 2)
-        root.addLayout(st_grid)
-
-        # 3. Kurir
-        root.addWidget(_over("KURIR"))
+        o_lay.addWidget(_over("KURIR"))
         c_row = QHBoxLayout()
-        c_row.setSpacing(12)
-        self._courier_checks: dict[str, QCheckBox] = {}
+        c_row.setSpacing(4)
+        self._courier_checks: dict[str, _DualFilterChip] = {}
         for c in COURIERS:
-            cb = QCheckBox(c)
-            cb.setCursor(Qt.PointingHandCursor)
-            cb.toggled.connect(self._on_changed)
+            cb = _DualFilterChip(c)
+            cb.mode_changed.connect(self._on_changed)
             self._courier_checks[c] = cb
             c_row.addWidget(cb)
         c_row.addStretch(1)
-        root.addLayout(c_row)
+        o_lay.addLayout(c_row)
 
-        # 4. Pembayaran
-        root.addWidget(_over("PEMBAYARAN"))
+        o_lay.addWidget(_over("PEMBAYARAN"))
         p_row = QHBoxLayout()
-        p_row.setSpacing(10)
-        self._pay_checks: dict[str, QCheckBox] = {}
+        p_row.setSpacing(4)
+        self._pay_checks: dict[str, _DualFilterChip] = {}
         for p_key in ("COD", "QRIS", "ShopeePay", "Lainnya"):
-            cb = QCheckBox(p_key)
-            cb.setCursor(Qt.PointingHandCursor)
-            cb.toggled.connect(self._on_changed)
+            cb = _DualFilterChip(p_key)
+            cb.mode_changed.connect(self._on_changed)
             self._pay_checks[p_key] = cb
             p_row.addWidget(cb)
         p_row.addStretch(1)
-        root.addLayout(p_row)
+        o_lay.addLayout(p_row)
 
-        # 5. Duplikat
-        root.addWidget(_over("DUPLIKAT"))
+        o_lay.addWidget(_over("DUPLIKAT"))
         d_row = QHBoxLayout()
         d_row.setSpacing(6)
         self._dup_btns: dict[str, QPushButton] = {}
-        for dk, dlbl in (("", "Semua"), ("only", "Hanya Duplikat"), ("non_dup", "Non-Duplikat")):
+        for dk, dlbl in (("", "Semua"), ("only", "Duplikat"), ("non_dup", "Non-Duplikat")):
             b = QPushButton(dlbl)
             b.setObjectName("PresetChip")
             b.setCheckable(True)
@@ -746,103 +991,171 @@ class FilterPopover(QFrame):
             self._dup_btns[dk] = b
             d_row.addWidget(b)
         d_row.addStretch(1)
-        root.addLayout(d_row)
+        o_lay.addLayout(d_row)
 
-    def _set_status_mode(self, mode: str) -> None:
-        self._btn_inc.setChecked(mode == "include")
-        self._btn_exc.setChecked(mode == "exclude")
-        self._sync_preset_state()
-        if self._st_checks and any(cb.isChecked() for cb in self._st_checks.values()):
+        lbl_hint_o = QLabel("1× ✓ tampilkan · 2× ✕ kecualikan")
+        lbl_hint_o.setObjectName("MutedText")
+        lbl_hint_o.setStyleSheet("font-size: 10.5px;")
+        o_lay.addWidget(lbl_hint_o)
+        o_lay.addStretch(1)
+        self._tabs_stack.addWidget(pg_other)
+
+        self._sync_tab_badges()
+
+    def _set_tab(self, idx: int) -> None:
+        self._tabs_stack.setCurrentIndex(idx)
+        for i, b in enumerate(self._tab_btns):
+            b.setChecked(i == idx)
+
+    def _sync_tab_badges(self) -> None:
+        st = self.state()
+        n_st = len(st["statuses_inc"]) + len(st["statuses_exc"])
+        n_dt = 1 if st["date_preset"] else 0
+        n_oth = (
+            len(st["lifecycles_inc"]) + len(st["lifecycles_exc"])
+            + len(st["couriers_inc"]) + len(st["couriers_exc"])
+            + len(st["payments_inc"]) + len(st["payments_exc"])
+            + (1 if st["dup_filter"] else 0)
+        )
+        self._tab_status.setText(f"Status · {n_st}" if n_st else "Status")
+        self._tab_date.setText(f"Tanggal · {n_dt}" if n_dt else "Tanggal")
+        self._tab_other.setText(f"Lainnya · {n_oth}" if n_oth else "Lainnya")
+
+    def _set_date_preset(self, preset: str) -> None:
+        self._date_preset = preset
+        for k, b in self._date_btns.items():
+            b.setChecked(k == preset)
+        self._date_range_row.setVisible(preset == "custom")
+        self._sync_tab_badges()
+        self.adjustSize()
+        self.filters_changed.emit()
+
+    def _on_custom_date_changed(self, *_args) -> None:
+        if self._date_preset == "custom":
+            self._sync_tab_badges()
             self.filters_changed.emit()
 
     def _set_dup_mode(self, mode: str) -> None:
         for k, b in self._dup_btns.items():
             b.setChecked(k == mode)
+        self._sync_tab_badges()
         self.filters_changed.emit()
 
     def _sync_preset_state(self) -> None:
-        checked_st = {k for k, cb in self._st_checks.items() if cb.isChecked()}
-        is_no_canc = self._btn_exc.isChecked() and checked_st == {ST_CANCELED_BUYER, ST_CANCELED_SYSTEM}
+        is_no_canc = (
+            self._st_checks[ST_CANCELED_BUYER].filter_mode == "exclude"
+            and self._st_checks[ST_CANCELED_SYSTEM].filter_mode == "exclude"
+        )
         self._btn_no_canc.setChecked(is_no_canc)
+        self._sync_tab_badges()
 
     def _on_changed(self, *_args) -> None:
         self._sync_preset_state()
         self.filters_changed.emit()
 
+    @staticmethod
+    def _split_modes(grp: dict[str, _DualFilterChip]) -> tuple[set[str], set[str]]:
+        inc = {k for k, c in grp.items() if c.filter_mode == "include"}
+        exc = {k for k, c in grp.items() if c.filter_mode == "exclude"}
+        return inc, exc
+
     def state(self) -> dict:
         dup_mode = next((k for k, b in self._dup_btns.items() if b.isChecked()), "")
+        lc_inc, lc_exc = self._split_modes(self._lc_checks)
+        st_inc, st_exc = self._split_modes(self._st_checks)
+        c_inc, c_exc = self._split_modes(self._courier_checks)
+        p_inc, p_exc = self._split_modes(self._pay_checks)
+        qd_from = self._dt_from.date()
+        qd_to = self._dt_to.date()
+        c_from = date(qd_from.year(), qd_from.month(), qd_from.day())
+        c_to = date(qd_to.year(), qd_to.month(), qd_to.day())
+        d_from, d_to = resolve_date_range(self._date_preset, c_from, c_to)
         return {
-            "lifecycles": {k for k, cb in self._lc_checks.items() if cb.isChecked()},
-            "status_mode": "exclude" if self._btn_exc.isChecked() else "include",
-            "statuses": {k for k, cb in self._st_checks.items() if cb.isChecked()},
-            "couriers": {k for k, cb in self._courier_checks.items() if cb.isChecked()},
-            "payments": {k for k, cb in self._pay_checks.items() if cb.isChecked()},
+            "lifecycles_inc": lc_inc,
+            "lifecycles_exc": lc_exc,
+            "statuses_inc": st_inc,
+            "statuses_exc": st_exc,
+            "couriers_inc": c_inc,
+            "couriers_exc": c_exc,
+            "payments_inc": p_inc,
+            "payments_exc": p_exc,
             "dup_filter": dup_mode,
+            "date_preset": self._date_preset,
+            "date_from": d_from,
+            "date_to": d_to,
         }
 
     def active_group_count(self) -> int:
         st = self.state()
         return (
-            int(bool(st["lifecycles"]))
-            + int(bool(st["statuses"]))
-            + int(bool(st["couriers"]))
-            + int(bool(st["payments"]))
+            int(bool(st["date_preset"]))
+            + int(bool(st["lifecycles_inc"]))
+            + int(bool(st["lifecycles_exc"]))
+            + int(bool(st["statuses_inc"]))
+            + int(bool(st["statuses_exc"]))
+            + int(bool(st["couriers_inc"]))
+            + int(bool(st["couriers_exc"]))
+            + int(bool(st["payments_inc"]))
+            + int(bool(st["payments_exc"]))
             + int(bool(st["dup_filter"]))
         )
 
     def apply_no_canceled_preset(self) -> None:
-        for cb in self._st_checks.values():
-            cb.blockSignals(True)
-        if self._btn_no_canc.isChecked():
-            self._btn_inc.setChecked(False)
-            self._btn_exc.setChecked(True)
-            for k, cb in self._st_checks.items():
-                cb.setChecked(k in (ST_CANCELED_BUYER, ST_CANCELED_SYSTEM))
-        else:
-            for cb in self._st_checks.values():
-                cb.setChecked(False)
-            self._btn_inc.setChecked(True)
-            self._btn_exc.setChecked(False)
-        for cb in self._st_checks.values():
-            cb.blockSignals(False)
+        want = self._btn_no_canc.isChecked()
+        for k in (ST_CANCELED_BUYER, ST_CANCELED_SYSTEM):
+            cb = self._st_checks[k]
+            if want:
+                cb.set_filter_mode("exclude", emit=False)
+            elif cb.filter_mode == "exclude":
+                cb.set_filter_mode("", emit=False)
         self._sync_preset_state()
         self.filters_changed.emit()
 
     def clear_group(self, group: str) -> None:
-        mapping = {
+        base_map = {
             "lifecycles": self._lc_checks,
             "statuses": self._st_checks,
             "couriers": self._courier_checks,
             "payments": self._pay_checks,
         }
-        if group in mapping:
-            for cb in mapping[group].values():
-                cb.blockSignals(True)
-                cb.setChecked(False)
-                cb.blockSignals(False)
-            if group == "statuses":
-                self._btn_inc.setChecked(True)
-                self._btn_exc.setChecked(False)
+        if group in base_map:
+            for cb in base_map[group].values():
+                cb.set_filter_mode("", emit=False)
+        elif group.endswith("_inc") or group.endswith("_exc"):
+            dim, mode = group[:-4], ("include" if group.endswith("_inc") else "exclude")
+            if dim in base_map:
+                for cb in base_map[dim].values():
+                    if cb.filter_mode == mode:
+                        cb.set_filter_mode("", emit=False)
         elif group == "dup_filter":
             for k, b in self._dup_btns.items():
                 b.setChecked(k == "")
+        elif group == "date":
+            self._date_preset = ""
+            for k, b in self._date_btns.items():
+                b.setChecked(k == "")
+            self._date_range_row.hide()
+            self.adjustSize()
         self._sync_preset_state()
         self.filters_changed.emit()
 
     def reset_all(self) -> None:
         for grp in (self._lc_checks, self._st_checks, self._courier_checks, self._pay_checks):
             for cb in grp.values():
-                cb.blockSignals(True)
-                cb.setChecked(False)
-                cb.blockSignals(False)
-        self._btn_inc.setChecked(True)
-        self._btn_exc.setChecked(False)
+                cb.set_filter_mode("", emit=False)
         for k, b in self._dup_btns.items():
             b.setChecked(k == "")
+        self._date_preset = ""
+        for k, b in self._date_btns.items():
+            b.setChecked(k == "")
+        self._date_range_row.hide()
+        self.adjustSize()
         self._sync_preset_state()
         self.filters_changed.emit()
 
     def show_below(self, anchor: QWidget) -> None:
+        self._anchor_widget = anchor
+        self._closed_by_anchor = False
         self.adjustSize()
         pos = anchor.mapToGlobal(anchor.rect().bottomRight())
         x = pos.x() - self.width()
@@ -852,6 +1165,203 @@ class FilterPopover(QFrame):
             geo = scr.availableGeometry()
             x = max(geo.left() + 8, min(x, geo.right() - self.width() - 8))
             y = max(geo.top() + 8, min(y, geo.bottom() - self.sizeHint().height() - 8))
+        self.move(x, y)
+        self.show()
+
+    def hideEvent(self, event) -> None:
+        self._closed_at = time.monotonic()
+        if self._anchor_widget is not None and self._anchor_widget.isVisible():
+            local_pos = self._anchor_widget.mapFromGlobal(QCursor.pos())
+            self._closed_by_anchor = self._anchor_widget.rect().contains(local_pos)
+        else:
+            self._closed_by_anchor = False
+        super().hideEvent(event)
+
+    def consume_anchor_close(self) -> bool:
+        hit = self._closed_by_anchor and (time.monotonic() - self._closed_at) < 0.8
+        self._closed_by_anchor = False
+        return hit
+
+
+class _DupGroupItemFrame(QFrame):
+    """Clickable row card inside DuplicateGroupPopover."""
+
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("DupPopoverItem")
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+class DuplicateGroupPopover(QFrame):
+    """Floating minimalist popover showing all duplicate orders sharing a recipient."""
+
+    order_selected = Signal(str)
+    filter_group_requested = Signal(str, list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint)
+        self.setObjectName("FilterPopover")
+        self.setFixedWidth(396)
+        self._group_label = ""
+        self._group_resis: list[str] = []
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(10)
+
+        hdr = QHBoxLayout()
+        hdr.setSpacing(8)
+        title_col = QVBoxLayout()
+        title_col.setContentsMargins(0, 0, 0, 0)
+        title_col.setSpacing(2)
+        self._lbl_title = QLabel("Duplikat Penerima")
+        self._lbl_title.setStyleSheet("font-size: 13px; font-weight: 700;")
+        self._lbl_sub = QLabel("")
+        self._lbl_sub.setObjectName("MutedText")
+        self._lbl_sub.setStyleSheet("font-size: 11px;")
+        title_col.addWidget(self._lbl_title)
+        title_col.addWidget(self._lbl_sub)
+
+        self._btn_filter_tbl = QPushButton("Filter di tabel")
+        self._btn_filter_tbl.setObjectName("PresetChip")
+        self._btn_filter_tbl.setCursor(Qt.PointingHandCursor)
+        self._btn_filter_tbl.clicked.connect(self._on_filter_clicked)
+
+        hdr.addLayout(title_col, 1)
+        hdr.addWidget(self._btn_filter_tbl, 0, Qt.AlignTop)
+        root.addLayout(hdr)
+
+        div = QFrame()
+        div.setObjectName("HairlineH")
+        root.addWidget(div)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._list_host = QWidget()
+        self._list_lay = QVBoxLayout(self._list_host)
+        self._list_lay.setContentsMargins(0, 0, 0, 0)
+        self._list_lay.setSpacing(6)
+        self._scroll.setWidget(self._list_host)
+        root.addWidget(self._scroll)
+
+    def _clear_items(self) -> None:
+        while self._list_lay.count():
+            item = self._list_lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.hide()
+                w.setParent(None)
+                w.deleteLater()
+
+    def _on_filter_clicked(self) -> None:
+        resis = list(self._group_resis)
+        label = self._group_label
+        self.close()
+        if resis:
+            self.filter_group_requested.emit(label, resis)
+
+    def _on_item_clicked(self, resi: str) -> None:
+        self.close()
+        if resi:
+            self.order_selected.emit(resi)
+
+    def show_group(self, anchor_global_pos: QPoint, current_resi: str, group_rows: list[dict], is_dark: bool) -> None:
+        self._clear_items()
+        t = get_tokens(is_dark)
+        cnt = len(group_rows)
+        self._lbl_title.setText(f"Duplikat Penerima · {cnt}x")
+
+        sample = group_rows[0] if group_rows else {}
+        rec_name = (sample.get("recipient_name") or "").strip() or "Penerima"
+        rec_phone = (sample.get("recipient_phone") or "").strip()
+        city = (sample.get("city") or "").strip()
+        sub_parts = [p for p in (rec_name, rec_phone, city) if p]
+        self._lbl_sub.setText(" · ".join(sub_parts))
+        self._group_label = f"{rec_name} ({cnt}x)"
+        self._group_resis = [str(r.get("resi") or "") for r in group_rows if r.get("resi")]
+
+        ordered = sorted(
+            group_rows,
+            key=lambda r: (0 if (r.get("resi") or "") == current_resi else 1, r.get("created_at") or "", r.get("resi") or ""),
+        )
+        for row in ordered:
+            resi = str(row.get("resi") or "")
+            card = _DupGroupItemFrame()
+            c_lay = QVBoxLayout(card)
+            c_lay.setContentsMargins(10, 8, 10, 8)
+            c_lay.setSpacing(4)
+
+            top = QHBoxLayout()
+            top.setSpacing(6)
+            buyer = (row.get("buyer_username") or "").strip() or "Tanpa Username"
+            lbl_buyer = QLabel(buyer)
+            lbl_buyer.setStyleSheet(f"font-size: 12px; font-weight: {'700' if row.get('buyer_username') else '500'}; color: {t['text_primary']};")
+            lbl_buyer.setAttribute(Qt.WA_TransparentForMouseEvents)
+            top.addWidget(lbl_buyer)
+
+            if resi == current_resi:
+                cur_tag = QLabel("Sedang dipilih")
+                cur_tag.setObjectName("DupCurrentTag")
+                cur_tag.setAttribute(Qt.WA_TransparentForMouseEvents)
+                top.addWidget(cur_tag)
+
+            top.addStretch(1)
+            st = effective_status(row)
+            s_bg, s_fg, _dot, s_lbl = status_style(st, is_dark)
+            pill = QLabel(s_lbl)
+            pill.setStyleSheet(
+                f"background-color: {s_bg}; color: {s_fg}; border-radius: 9px; "
+                "padding: 2px 8px; font-size: 10.5px; font-weight: 700;"
+            )
+            pill.setAttribute(Qt.WA_TransparentForMouseEvents)
+            top.addWidget(pill)
+            c_lay.addLayout(top)
+
+            bot = QHBoxLayout()
+            bot.setSpacing(6)
+            meta_parts = [resi]
+            courier = (row.get("courier") or "").strip().upper()
+            if courier:
+                meta_parts.append(courier)
+            tp = int(row.get("total_payment") or 0)
+            if tp > 0:
+                meta_parts.append(format_idr(tp))
+            dt = (row.get("last_event_time") or row.get("created_at") or "").strip()
+            if dt:
+                meta_parts.append(dt)
+            lbl_meta = QLabel(" · ".join(meta_parts))
+            lbl_meta.setStyleSheet(f"font-family: Consolas, monospace; font-size: 10.5px; color: {t['text_muted']};")
+            lbl_meta.setAttribute(Qt.WA_TransparentForMouseEvents)
+            bot.addWidget(lbl_meta, 1)
+            c_lay.addLayout(bot)
+
+            card.clicked.connect(lambda _r=resi: self._on_item_clicked(_r))
+            self._list_lay.addWidget(card)
+
+        self._list_host.adjustSize()
+        scroll_h = min(320, max(64, self._list_host.sizeHint().height() + 4))
+        self._scroll.setFixedHeight(scroll_h)
+        self.adjustSize()
+
+        x = anchor_global_pos.x()
+        y = anchor_global_pos.y() + 6
+        scr = QApplication.screenAt(anchor_global_pos) or QApplication.primaryScreen()
+        if scr is not None:
+            geo = scr.availableGeometry()
+            x = max(geo.left() + 8, min(x, geo.right() - self.width() - 8))
+            if y + self.sizeHint().height() > geo.bottom() - 8:
+                y = max(geo.top() + 8, anchor_global_pos.y() - self.sizeHint().height() - 22)
         self.move(x, y)
         self.show()
 
@@ -1042,20 +1552,25 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self.apply_theme(self.current_theme)
+        self._refresh_last_sync_label()
         if not self.settings.get("inspector_open", True):
             self.close_inspector(save=False)
 
         self.statusBar().showMessage("Siap memantau pesanan tokomu.")
         self.reload()
 
-        # Background periodic refresh timer
+        # Background periodic refresh timer (courier status & realtime Shopee polling)
         self.timer = QTimer(self)
         self.timer.timeout.connect(lambda: self.track_rows(self.db.active_resis(), auto=True))
+        self._shopee_sync_timer = QTimer(self)
+        self._shopee_sync_timer.timeout.connect(self._auto_sync_shopee_realtime)
         self._apply_timer()
 
-        # Silent startup auto-sync so statuses update without double-click
+        # Silent startup auto-sync so new Shopee orders & tracking statuses update automatically
         if self._auto_sync_enabled:
             QTimer.singleShot(450, self._auto_sync_stale_on_startup)
+            if self.settings.get("shopee_auto_sync_enabled", True) and self._shopee().authorised():
+                QTimer.singleShot(1400, self._auto_sync_shopee_realtime)
 
     # ------------------------------------------------------------------ Theme Application
     def apply_theme(self, theme_name: str):
@@ -1250,14 +1765,21 @@ class MainWindow(QMainWindow):
         self._lbl_view_count.setFixedHeight(22)
         self._lbl_view_count.setAlignment(Qt.AlignCenter)
 
+        self._lbl_last_sync = QLabel("")
+        self._lbl_last_sync.setObjectName("MutedText")
+        self._lbl_last_sync.setStyleSheet("font-size: 11px; padding-left: 4px;")
+        self._lbl_last_sync.setMaximumWidth(168)
+        self._lbl_last_sync.hide()
+
         h_lay.addWidget(self._lbl_view_title, 0, Qt.AlignVCenter)
         h_lay.addWidget(self._lbl_view_count, 0, Qt.AlignVCenter)
+        h_lay.addWidget(self._lbl_last_sync, 0, Qt.AlignVCenter)
         h_lay.addStretch(1)
 
         self.btn_import = QPushButton("Impor")
         self.btn_import.setObjectName("SecondaryBtn")
         self.btn_import.setCursor(Qt.PointingHandCursor)
-        self.btn_import.setToolTip("Impor file pesanan Shopee (.xlsx / .xls / .csv)")
+        self.btn_import.setToolTip("Impor file pesanan Shopee (.xlsx / .xls / .csv) — bisa pilih beberapa file sekaligus")
         self.btn_import.clicked.connect(self.import_file)
 
         self.btn_batch_track = QPushButton("Lacak")
@@ -1437,7 +1959,14 @@ class MainWindow(QMainWindow):
         self.table.setColumnWidth(COL["status"], 166)
         self.table.sortByColumn(-1, Qt.AscendingOrder)
 
+        self._dup_group_resis: set[str] = set()
+        self._dup_group_label: str = ""
+        self._dup_popover = DuplicateGroupPopover(self)
+        self._dup_popover.order_selected.connect(self._select_and_focus_resi)
+        self._dup_popover.filter_group_requested.connect(self._apply_dup_group_filter)
+
         self.table.copy_resi_requested.connect(self._copy_resi_inline)
+        self.table.duplicate_badge_clicked.connect(self._on_duplicate_badge_clicked)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._context_menu)
         self.table.selectionModel().selectionChanged.connect(self._on_table_selection_changed)
@@ -1599,6 +2128,8 @@ class MainWindow(QMainWindow):
 
     def _reset_filters(self):
         self.search.clear()
+        self._dup_group_resis.clear()
+        self._dup_group_label = ""
         if hasattr(self, "_filter_popover"):
             self._filter_popover.blockSignals(True)
             self._filter_popover.reset_all()
@@ -1608,14 +2139,42 @@ class MainWindow(QMainWindow):
             self.btn_arch.setChecked(False)
         self._on_nav_clicked("", "")
 
+    def _on_duplicate_badge_clicked(self, resi: str, global_pos: QPoint):
+        group_rows = list(self._dup_map.get(resi) or [])
+        if len(group_rows) < 2:
+            return
+        self._dup_popover.show_group(
+            global_pos, resi, group_rows, is_dark=(self.current_theme == "dark")
+        )
+
+    def _apply_dup_group_filter(self, label: str, resis: list[str]):
+        self._dup_group_resis = {str(r) for r in resis if r}
+        self._dup_group_label = label or f"{len(self._dup_group_resis)}x"
+        if self.show_archived or self.active_category_filter or (
+            self.active_status_filter and self.active_status_filter != FILTER_DUPLICATE
+        ):
+            self._on_nav_clicked("", "")
+        else:
+            self._filter()
+
+    def _clear_dup_group_filter(self):
+        self._dup_group_resis.clear()
+        self._dup_group_label = ""
+        self._filter()
+
     def _open_filter_popover(self):
+        if self._filter_popover.isVisible():
+            self._filter_popover.hide()
+            return
+        if self._filter_popover.consume_anchor_close():
+            return
         self._filter_popover.show_below(self.btn_filter)
 
     def _refresh_filter_btn_state(self):
         if not hasattr(self, "btn_filter") or not hasattr(self, "_filter_popover"):
             return
         t = get_tokens(self.current_theme == "dark")
-        cnt = self._filter_popover.active_group_count()
+        cnt = self._filter_popover.active_group_count() + (1 if self._dup_group_resis else 0)
         if cnt > 0:
             self.btn_filter.setText(f"Filter · {cnt}")
             self.btn_filter.setObjectName("FilterActiveBtn")
@@ -1639,54 +2198,103 @@ class MainWindow(QMainWindow):
                 w.deleteLater()
 
         st = self._filter_popover.state()
-        chips: list[tuple[str, str]] = []
-        if st["lifecycles"]:
-            lc_names = {CAT_ACTIVE: "Berjalan", CAT_FINISHED: "Selesai", CAT_OTHER: "Lainnya"}
-            lbls = ", ".join(lc_names.get(k, k) for k in (CAT_ACTIVE, CAT_FINISHED, CAT_OTHER) if k in st["lifecycles"])
-            chips.append(("lifecycles", f"Kategori: {lbls}  ×"))
-        if st["statuses"]:
-            prefix = "Kecuali" if st["status_mode"] == "exclude" else "Status"
-            if st["status_mode"] == "exclude" and st["statuses"] == {ST_CANCELED_BUYER, ST_CANCELED_SYSTEM}:
-                chips.append(("statuses", "Tanpa Canceled  ×"))
+        # Each tuple: (group_key, chip_text, is_exclude, tooltip)
+        chips: list[tuple[str, str, bool, str]] = []
+        if self._dup_group_resis:
+            chips.append(("dup_group", f"Duplikat: {self._dup_group_label}  ×", False, ""))
+
+        if st["date_preset"]:
+            dp = st["date_preset"]
+            d_from, d_to = st["date_from"], st["date_to"]
+            if dp == "custom" and d_from is not None and d_to is not None:
+                dlbl = f"{format_date_short(d_from)} – {format_date_short(d_to)}  ×"
             else:
-                lbls = ", ".join(_FILTER_STATUS_LABELS.get(k, k) for k, _ in _FILTER_STATUS_ITEMS if k in st["statuses"])
-                chips.append(("statuses", f"{prefix}: {lbls}  ×"))
-        if st["couriers"]:
-            lbls = ", ".join(c for c in COURIERS if c in st["couriers"])
-            chips.append(("couriers", f"Kurir: {lbls}  ×"))
-        if st["payments"]:
-            lbls = ", ".join(p for p in ("COD", "QRIS", "ShopeePay", "Lainnya") if p in st["payments"])
-            chips.append(("payments", f"Bayar: {lbls}  ×"))
+                dlbl = f"{_DATE_PRESET_LABELS.get(dp, dp)}  ×"
+            dtip = (
+                f"Tanggal: {format_date_short(d_from)} s/d {format_date_short(d_to)}"
+                if (d_from is not None and d_to is not None)
+                else ""
+            )
+            chips.append(("date", dlbl, False, dtip))
+
+        lc_names = {CAT_ACTIVE: "Berjalan", CAT_FINISHED: "Selesai", CAT_OTHER: "Lainnya"}
+        for key_name, prefix, is_exc in (
+            ("lifecycles_inc", "✓", False),
+            ("lifecycles_exc", "✕", True),
+        ):
+            vals = st[key_name]
+            if vals:
+                lbls = ", ".join(lc_names.get(k, k) for k in (CAT_ACTIVE, CAT_FINISHED, CAT_OTHER) if k in vals)
+                chips.append((key_name, f"{prefix} {lbls}  ×", is_exc, ""))
+
+        for key_name, is_exc in (("statuses_inc", False), ("statuses_exc", True)):
+            vals = st[key_name]
+            if not vals:
+                continue
+            if is_exc and vals == {ST_CANCELED_BUYER, ST_CANCELED_SYSTEM}:
+                chips.append((key_name, "✕ Tanpa Canceled  ×", True, "Kecuali Canceled - Pembeli, Canceled - Sistem"))
+            else:
+                ordered = [_FILTER_STATUS_LABELS.get(k, k) for k, _ in _FILTER_STATUS_ITEMS if k in vals]
+                prefix = "✕" if is_exc else "✓"
+                lbls = f"{len(ordered)} status" if len(ordered) > 2 else ", ".join(ordered)
+                chips.append((key_name, f"{prefix} {lbls}  ×", is_exc, ", ".join(ordered)))
+
+        for key_name, prefix, is_exc in (
+            ("couriers_inc", "✓", False),
+            ("couriers_exc", "✕", True),
+        ):
+            vals = st[key_name]
+            if vals:
+                lbls = ", ".join(c for c in COURIERS if c in vals)
+                chips.append((key_name, f"{prefix} {lbls}  ×", is_exc, ""))
+
+        for key_name, prefix, is_exc in (
+            ("payments_inc", "✓", False),
+            ("payments_exc", "✕", True),
+        ):
+            vals = st[key_name]
+            if vals:
+                lbls = ", ".join(p for p in ("COD", "QRIS", "ShopeePay", "Lainnya") if p in vals)
+                chips.append((key_name, f"{prefix} {lbls}  ×", is_exc, ""))
+
         if st["dup_filter"] == "only":
-            chips.append(("dup_filter", "Hanya Duplikat  ×"))
+            chips.append(("dup_filter", "Duplikat  ×", False, ""))
         elif st["dup_filter"] == "non_dup":
-            chips.append(("dup_filter", "Non-Duplikat  ×"))
+            chips.append(("dup_filter", "Non-Duplikat  ×", False, ""))
 
         if not chips:
             self._filter_bar.hide()
             return
 
-        for grp, text in chips:
+        for grp, text, is_exc, tip in chips:
             b = QPushButton(text)
-            b.setObjectName("FilterChip")
+            b.setObjectName("FilterChipExclude" if is_exc else "FilterChip")
             b.setCursor(Qt.PointingHandCursor)
-            b.setToolTip("Klik untuk menghapus filter ini")
-            b.clicked.connect(lambda _c=False, g=grp: self._filter_popover.clear_group(g))
+            b.setToolTip(f"{tip}\nKlik untuk menghapus filter ini".strip() if tip else "Klik untuk menghapus filter ini")
+            if grp == "dup_group":
+                b.clicked.connect(self._clear_dup_group_filter)
+            else:
+                b.clicked.connect(lambda _c=False, g=grp: self._filter_popover.clear_group(g))
             self._filter_bar_lay.addWidget(b)
 
         self._filter_bar_lay.addStretch(1)
         btn_clr = QPushButton("Reset semua")
         btn_clr.setObjectName("GhostBtn")
         btn_clr.setCursor(Qt.PointingHandCursor)
-        btn_clr.clicked.connect(self._filter_popover.reset_all)
+        btn_clr.clicked.connect(self._reset_all_checklist_and_group)
         self._filter_bar_lay.addWidget(btn_clr)
         self._filter_bar.show()
+
+    def _reset_all_checklist_and_group(self):
+        self._dup_group_resis.clear()
+        self._dup_group_label = ""
+        self._filter_popover.reset_all()
 
     def _filter(self):
         self.proxy.text = self.search.text().strip()
         is_dup_view = (not self.show_archived) and (self.active_status_filter == FILTER_DUPLICATE)
         self.proxy.duplicates_only = is_dup_view
-        self.table.duplicate_view_mode = is_dup_view
+        self.table.duplicate_view_mode = is_dup_view or bool(self._dup_group_resis)
         if is_dup_view:
             self.proxy.category = ""
             self.proxy.status = ""
@@ -1694,13 +2302,20 @@ class MainWindow(QMainWindow):
             self.proxy.category = "" if self.show_archived else self.active_category_filter
             self.proxy.status = self.active_status_filter
 
+        self.proxy.dup_group_resis = set(self._dup_group_resis)
+
         st = self._filter_popover.state()
-        self.proxy.checked_lifecycles = st["lifecycles"]
-        self.proxy.status_mode = st["status_mode"]
-        self.proxy.checked_statuses = st["statuses"]
-        self.proxy.checked_couriers = st["couriers"]
-        self.proxy.checked_payments = st["payments"]
+        self.proxy.lifecycles_inc = st["lifecycles_inc"]
+        self.proxy.lifecycles_exc = st["lifecycles_exc"]
+        self.proxy.statuses_inc = st["statuses_inc"]
+        self.proxy.statuses_exc = st["statuses_exc"]
+        self.proxy.couriers_inc = st["couriers_inc"]
+        self.proxy.couriers_exc = st["couriers_exc"]
+        self.proxy.payments_inc = st["payments_inc"]
+        self.proxy.payments_exc = st["payments_exc"]
         self.proxy.dup_filter = st["dup_filter"]
+        self.proxy.date_from = st["date_from"]
+        self.proxy.date_to = st["date_to"]
 
         self.proxy.invalidateFilter()
         self._refresh_filter_btn_state()
@@ -1718,6 +2333,7 @@ class MainWindow(QMainWindow):
         has_filter = bool(
             self.proxy.text
             or self._filter_popover.active_group_count() > 0
+            or self.proxy.dup_group_resis
             or self.proxy.category
             or self.proxy.status
             or self.proxy.duplicates_only
@@ -2072,6 +2688,8 @@ class MainWindow(QMainWindow):
             self._sync_banner.hide()
             self._refresh_batch_button_state()
             self._update_nav_counts()
+            if not w.cancelled:
+                self._record_last_sync(shopee_synced=False)
             self.statusBar().showMessage(msg)
 
         def on_err(msg: str):
@@ -2106,13 +2724,16 @@ class MainWindow(QMainWindow):
         event.ignore()
 
     def dropEvent(self, event: QDropEvent):
+        paths: list[str] = []
         for url in event.mimeData().urls():
             if url.isLocalFile():
                 p = url.toLocalFile()
                 if p.lower().endswith((".xlsx", ".xls", ".csv", ".txt")):
-                    self._import_path(p)
-                    event.acceptProposedAction()
-                    return
+                    paths.append(p)
+        if paths:
+            self._import_paths(paths)
+            event.acceptProposedAction()
+            return
         event.ignore()
 
     # ------------------------------------------------------------------ Actions & Import
@@ -2133,53 +2754,76 @@ class MainWindow(QMainWindow):
                 self.track_rows(rows, auto=True)
 
     def import_file(self):
-        path, _ = QFileDialog.getOpenFileName(
+        paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "Pilih File Export Shopee",
+            "Pilih File Export Shopee (Bisa Lebih dari Satu)",
             "",
             "Semua Format Pesanan (*.xlsx *.xls *.csv *.txt);;Excel Spreadsheet (*.xlsx *.xls);;CSV Text (*.csv *.txt);;Semua File (*.*)",
         )
-        if path:
-            self._import_path(path)
+        if paths:
+            self._import_paths(paths)
 
     def _import_path(self, path: str):
-        try:
-            recs, warns = importer.parse_file(path)
-        except Exception as e:
-            QMessageBox.critical(self, "Gagal Membaca File", f"File tidak dapat dibaca:\n\n{e}")
+        self._import_paths([path])
+
+    def _import_paths(self, paths: list[str]):
+        clean_paths = [str(p) for p in paths if str(p).strip()]
+        if not clean_paths:
             return
 
-        new = upd = dup = 0
+        total_new = total_upd = total_dup = 0
+        files_ok = 0
         changed_resis: set[str] = set()
-        for rec in recs:
-            rec["order_source"] = "csv"
-            res = self.db.upsert(rec)
-            if res == "new":
-                new += 1
-                changed_resis.add(rec["resi"])
-            elif res == "updated":
-                upd += 1
-                changed_resis.add(rec["resi"])
-            else:
-                dup += 1
+        all_warns: list[str] = []
+        file_errors: list[str] = []
+
+        for path in clean_paths:
+            fname = Path(path).name
+            try:
+                recs, warns = importer.parse_file(path)
+            except Exception as e:
+                file_errors.append(f"• {fname}: {e}")
+                continue
+            files_ok += 1
+            for w in warns:
+                msg = f"[{fname}] {w}" if len(clean_paths) > 1 else w
+                if msg not in all_warns:
+                    all_warns.append(msg)
+            for rec in recs:
+                rec["order_source"] = "csv"
+                res = self.db.upsert(rec)
+                if res == "new":
+                    total_new += 1
+                    changed_resis.add(rec["resi"])
+                elif res == "updated":
+                    total_upd += 1
+                    changed_resis.add(rec["resi"])
+                else:
+                    total_dup += 1
+
+        if files_ok == 0 and file_errors:
+            QMessageBox.critical(self, "Gagal Membaca File", "File tidak dapat dibaca:\n\n" + "\n".join(file_errors))
+            return
 
         self.reload()
-        if new == 0 and upd == 0 and dup > 0:
-            summary = f"Semua {dup} pesanan di file ini sudah ada di daftar (dilewati otomatis agar tidak dobel)."
+        prefix = f"Impor {files_ok} file selesai" if len(clean_paths) > 1 else "Impor selesai"
+        if total_new == 0 and total_upd == 0 and total_dup > 0 and not file_errors:
+            summary = f"Semua {total_dup} pesanan sudah ada di daftar (dilewati otomatis agar tidak dobel)."
             self.statusBar().showMessage(summary)
             QMessageBox.information(self, "Data Sudah Ada", summary)
         else:
             parts = []
-            if new:
-                parts.append(f"{new} baru")
-            if upd:
-                parts.append(f"{upd} diperbarui")
-            if dup:
-                parts.append(f"{dup} sudah ada (dilewati)")
-            summary = f"Impor selesai: {', '.join(parts)}."
+            if total_new:
+                parts.append(f"{total_new} baru")
+            if total_upd:
+                parts.append(f"{total_upd} diperbarui")
+            if total_dup:
+                parts.append(f"{total_dup} sudah ada (dilewati)")
+            summary = f"{prefix}: {', '.join(parts)}." if parts else f"{prefix}."
             self.statusBar().showMessage(summary)
-            if warns:
-                QMessageBox.warning(self, "Catatan Impor", summary + "\n\n" + "\n".join(warns))
+            notes = file_errors + all_warns
+            if notes:
+                QMessageBox.warning(self, "Catatan Impor", summary + "\n\n" + "\n".join(notes))
 
         # Auto-sync active untracked orders from changed imports seamlessly
         if changed_resis and self._batch_worker is None:
@@ -2194,6 +2838,92 @@ class MainWindow(QMainWindow):
 
         return ShopeeClient(settings if settings is not None else self.settings, on_tokens_changed=persist)
 
+    def _record_last_sync(self, shopee_synced: bool = False) -> None:
+        now = datetime.now()
+        self.settings["shopee_last_sync_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
+        if shopee_synced:
+            self.settings["shopee_last_sync_ts"] = int(time.time())
+        save_settings(self.settings)
+        self._refresh_last_sync_label()
+
+    def _refresh_last_sync_label(self) -> None:
+        if not hasattr(self, "_lbl_last_sync"):
+            return
+        raw = str(self.settings.get("shopee_last_sync_at") or "").strip()
+        if not raw:
+            self._lbl_last_sync.hide()
+            return
+        dt = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                dt = datetime.strptime(raw[:len(fmt) + 2], fmt)
+                break
+            except ValueError:
+                continue
+        if dt is None:
+            self._lbl_last_sync.hide()
+            return
+        if dt.date() == date.today():
+            short_txt = f"Diperbarui {dt.strftime('%H:%M')}"
+        else:
+            short_txt = f"Diperbarui {format_date_short(dt.date())[:6]} {dt.strftime('%H:%M')}"
+        self._lbl_last_sync.setText(short_txt)
+        mins = max(1, int(self.settings.get("shopee_auto_sync_minutes", 2) or 2))
+        auto_on = bool(self.settings.get("shopee_auto_sync_enabled", True)) and self._shopee().authorised()
+        auto_note = f"Auto Shopee tiap {mins} menit" if auto_on else "Auto Shopee nonaktif"
+        self._lbl_last_sync.setToolTip(
+            f"Terakhir diperbarui: {format_date_short(dt.date())} {dt.strftime('%H:%M')}\n{auto_note}"
+        )
+        self._lbl_last_sync.show()
+
+    def _auto_sync_shopee_realtime(self):
+        if self._sync_worker is not None or self._batch_worker is not None:
+            return
+        client = self._shopee()
+        if not client.authorised() or not self.settings.get("shopee_auto_sync_enabled", True):
+            return
+
+        last_ts = int(self.settings.get("shopee_last_sync_ts") or 0)
+        since_ts = max(0, last_ts - 300) if last_ts > 0 else max(0, int(time.time()) - 86400)
+        w = ShopeeSyncWorker(self.db, client, days=1, since_ts=since_ts, time_range_field="update_time")
+        self._sync_worker = w
+        self._active_workers.add(w)
+        sync_res = {"new": 0, "upd": 0, "resis": []}
+
+        def on_sync_completed(new_cnt: int, upd_cnt: int, resis: list):
+            sync_res["new"] = new_cnt
+            sync_res["upd"] = upd_cnt
+            sync_res["resis"] = list(resis)
+
+        def on_done(msg):
+            self._active_workers.discard(w)
+            if self._sync_worker is w:
+                self._sync_worker = None
+            if not w.cancelled:
+                self._record_last_sync(shopee_synced=True)
+            if sync_res["new"] > 0 or sync_res["upd"] > 0:
+                self.reload()
+                self.statusBar().showMessage(
+                    f"Shopee realtime: {sync_res['new']} pesanan baru, {sync_res['upd']} diperbarui."
+                )
+                rows_to_track = [
+                    r for r in (self.db.get(resi) for resi in sync_res["resis"])
+                    if r is not None and not str(r["resi"] or "").startswith("ORDER-")
+                ]
+                if rows_to_track:
+                    self.track_rows(rows_to_track, auto=True)
+
+        def on_err(msg):
+            self._active_workers.discard(w)
+            if self._sync_worker is w:
+                self._sync_worker = None
+            self.statusBar().showMessage(f"Auto-sync Shopee tertunda: {msg}")
+
+        w.signals.sync_completed.connect(on_sync_completed)
+        w.signals.finished.connect(on_done)
+        w.signals.error.connect(on_err)
+        self.pool.start(w)
+
     def sync_shopee(self):
         if self._sync_worker is not None or self._batch_worker is not None:
             QMessageBox.information(self, "Sedang Berjalan", "Proses sinkronisasi atau pelacakan masih berjalan.")
@@ -2207,20 +2937,37 @@ class MainWindow(QMainWindow):
             )
             self.open_settings()
             return
-        days, ok = QInputDialog.getInt(self, "Tarik Pesanan Shopee", "Ambil pesanan berapa hari terakhir?", 15, 1, 90)
-        if not ok:
+        dlg = ShopeeSyncDialog(self)
+        if not dlg.exec():
             return
-        w = ShopeeSyncWorker(self.db, client, days)
+        d_from, d_to = dlg.date_range()
+        since_ts, until_ts = dlg.timestamp_range()
+        days_span = max(1, (d_to - d_from).days + 1)
+        range_label = (
+            format_date_short(d_from)
+            if d_from == d_to
+            else f"{format_date_short(d_from)} – {format_date_short(d_to)}"
+        )
+        w = ShopeeSyncWorker(
+            self.db,
+            client,
+            days=days_span,
+            since_ts=since_ts,
+            until_ts=until_ts,
+            time_range_field="create_time",
+        )
         self._sync_worker = w
         self._active_workers.add(w)
         self._sync_prog.setRange(0, 0)
-        self._sync_lbl.setText("Menarik daftar pesanan dari Shopee API...")
+        self._sync_lbl.setText(f"Menarik pesanan Shopee ({range_label})...")
         self._sync_banner.show()
 
         def on_done(msg):
             self._active_workers.discard(w)
             self._sync_worker = None
             self._sync_banner.hide()
+            if not w.cancelled:
+                self._record_last_sync(shopee_synced=(d_to >= date.today()))
             self.reload()
             self.statusBar().showMessage(msg)
             self.track_rows(self.db.active_resis(), auto=True)
@@ -2277,6 +3024,18 @@ class MainWindow(QMainWindow):
             self.timer.start(mins * 60 * 1000)
         else:
             self.timer.stop()
+        if hasattr(self, "_shopee_sync_timer") and self._shopee_sync_timer is not None:
+            shp_mins = int(self.settings.get("shopee_auto_sync_minutes") or 0)
+            if (
+                self._auto_sync_enabled
+                and self.settings.get("shopee_auto_sync_enabled", True)
+                and shp_mins > 0
+                and self._shopee().authorised()
+            ):
+                self._shopee_sync_timer.start(max(1, shp_mins) * 60 * 1000)
+            else:
+                self._shopee_sync_timer.stop()
+        self._refresh_last_sync_label()
 
     def _open_courier_web_row(self, r: dict):
         resi = r.get("resi") or ""
@@ -2405,6 +3164,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if hasattr(self, "timer") and self.timer is not None:
             self.timer.stop()
+        if hasattr(self, "_shopee_sync_timer") and self._shopee_sync_timer is not None:
+            self._shopee_sync_timer.stop()
         if self._batch_worker is not None:
             self._batch_worker.cancelled = True
         if self._single_worker is not None:

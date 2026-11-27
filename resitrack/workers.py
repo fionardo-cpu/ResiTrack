@@ -16,6 +16,7 @@ class WorkerSignals(QObject):
     progress = Signal(str)                 # status bar text
     progress_count = Signal(int, int, str) # done_count, total_count, current_resi
     item_done = Signal(str)                # resi updated
+    sync_completed = Signal(int, int, list)  # new_count, updated_count, changed_resis
     finished = Signal(str)                 # summary
     error = Signal(str)
 
@@ -123,10 +124,14 @@ class TrackWorker(QRunnable):
 
 
 class ShopeeSyncWorker(QRunnable):
-    def __init__(self, db, client, days):
+    def __init__(self, db, client, days: int = 15, since_ts: int | None = None,
+                 until_ts: int | None = None, time_range_field: str = "create_time"):
         super().__init__()
         self.setAutoDelete(False)
         self.db, self.client, self.days = db, client, days
+        self.since_ts = since_ts
+        self.until_ts = until_ts
+        self.time_range_field = time_range_field
         self.signals = WorkerSignals()
         self.cancelled = False
 
@@ -139,18 +144,30 @@ class ShopeeSyncWorker(QRunnable):
     def run(self):
         try:
             self._safe_emit(self.signals.progress, "Sinkron pesanan Shopee...")
-            records = self.client.sync(self.days, progress=lambda m: self._safe_emit(self.signals.progress, m))
+            records = self.client.sync(
+                self.days,
+                progress=lambda m: self._safe_emit(self.signals.progress, m),
+                since_ts=self.since_ts,
+                until_ts=self.until_ts,
+                time_range_field=self.time_range_field,
+            )
             if self.cancelled:
                 self._safe_emit(self.signals.finished, "Sinkronisasi Shopee dibatalkan.")
                 return
             new = upd = 0
+            changed_resis: list[str] = []
             for r in records:
                 if self.cancelled:
                     self._safe_emit(self.signals.finished, f"Sinkronisasi Shopee dihentikan ({new + upd} diproses).")
                     return
                 res = self.db.upsert(r)
-                new += res == "new"
-                upd += res == "updated"
+                if res == "new":
+                    new += 1
+                    changed_resis.append(r["resi"])
+                elif res == "updated":
+                    upd += 1
+                    changed_resis.append(r["resi"])
+            self._safe_emit(self.signals.sync_completed, new, upd, changed_resis)
             self._safe_emit(self.signals.finished, f"Sync Shopee selesai: {len(records)} resi ({new} baru, {upd} diperbarui).")
         except Exception as e:  # noqa: BLE001
             traceback.print_exc()

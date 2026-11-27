@@ -545,6 +545,18 @@ QPushButton#FilterChip {{
 QPushButton#FilterChip:hover {{
     border-color: {t["accent"]};
 }}
+QPushButton#FilterChipExclude {{
+    background-color: {t["danger_soft"]};
+    color: {t["danger_fg"]};
+    border: 1px solid {t["danger_fg"]};
+    border-radius: 11px;
+    padding: 2px 9px;
+    font-size: 11px;
+    font-weight: 600;
+}}
+QPushButton#FilterChipExclude:hover {{
+    background-color: {t["danger_soft"]};
+}}
 QPushButton#PresetChip {{
     background-color: {t["bg_subtle"]};
     color: {t["text_secondary"]};
@@ -561,6 +573,49 @@ QPushButton#PresetChip:checked {{
     background-color: {t["accent_soft"]};
     color: {t["accent"]};
     border-color: {t["accent"]};
+    font-weight: 600;
+}}
+QPushButton#DualFilterChip {{
+    background-color: transparent;
+    color: {t["text_secondary"]};
+    border: 1px solid transparent;
+    border-radius: 7px;
+    padding: 5px 10px;
+    font-size: 12px;
+    font-weight: 500;
+    text-align: left;
+}}
+QPushButton#DualFilterChip:hover {{
+    background-color: {t["bg_subtle"]};
+    color: {t["text_primary"]};
+}}
+QPushButton#DualFilterChip[mode="include"] {{
+    background-color: {t["accent_soft"]};
+    color: {t["accent"]};
+    border-color: {t["accent"]};
+    font-weight: 600;
+}}
+QPushButton#DualFilterChip[mode="exclude"] {{
+    background-color: {t["danger_soft"]};
+    color: {t["danger_fg"]};
+    border-color: {t["danger_fg"]};
+    font-weight: 600;
+}}
+QFrame#DupPopoverItem {{
+    background-color: transparent;
+    border: 1px solid {t["border_hairline"]};
+    border-radius: 9px;
+}}
+QFrame#DupPopoverItem:hover {{
+    background-color: {t["bg_subtle"]};
+    border-color: {t["accent"]};
+}}
+QLabel#DupCurrentTag {{
+    background-color: {t["accent_soft"]};
+    color: {t["accent"]};
+    border-radius: 5px;
+    padding: 1px 6px;
+    font-size: 10px;
     font-weight: 600;
 }}
 
@@ -660,6 +715,61 @@ QLineEdit#SearchInput {{
 QLineEdit#SearchInput:focus {{
     background-color: {t["bg_surface"]};
     border: 1.5px solid {t["accent"]};
+}}
+QDateEdit {{
+    background-color: {t["bg_surface"]};
+    color: {t["text_primary"]};
+    border: 1px solid {t["border_control"]};
+    border-radius: 7px;
+    padding: 4px 24px 4px 8px;
+    min-height: 20px;
+    font-size: 12px;
+}}
+QDateEdit:hover {{
+    border-color: {t["border_hover"]};
+}}
+QDateEdit:focus {{
+    border: 1.5px solid {t["accent"]};
+}}
+QDateEdit::drop-down {{
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    width: 20px;
+    border: none;
+}}
+QDateEdit::down-arrow {{
+    image: url("{chev_down}");
+    width: 11px;
+    height: 11px;
+}}
+QCalendarWidget QWidget {{
+    background-color: {t["bg_surface"]};
+    color: {t["text_primary"]};
+}}
+QCalendarWidget QWidget#qt_calendar_navigationbar {{
+    background-color: {t["bg_subtle"]};
+    border-bottom: 1px solid {t["border_hairline"]};
+    padding: 4px;
+}}
+QCalendarWidget QToolButton {{
+    color: {t["text_primary"]};
+    background-color: transparent;
+    border: none;
+    border-radius: 5px;
+    padding: 4px 8px;
+    font-weight: 600;
+}}
+QCalendarWidget QToolButton:hover {{
+    background-color: {t["bg_hover"]};
+}}
+QCalendarWidget QAbstractItemView:enabled {{
+    background-color: {t["bg_surface"]};
+    color: {t["text_primary"]};
+    selection-background-color: {t["accent"]};
+    selection-color: {t["accent_text"]};
+}}
+QCalendarWidget QAbstractItemView:disabled {{
+    color: {t["text_muted"]};
 }}
 
 /* ComboBox & Popup List */
