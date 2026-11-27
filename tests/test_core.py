@@ -818,7 +818,7 @@ def test_spx_real_rts_completion_and_postponement_and_delivered():
     assert st_ba == ST_RTS_BALSIS
     assert row_lifecycle({"status": st_ba, "order_status": "Batal", "events_json": _json.dumps([e.__dict__ for e in evs_balsis_active])}) == CAT_ACTIVE
 
-    # 4. SPX F650 temporary redelivery postponement (dumyya pattern) must NOT be ST_FAILED / Gagal - Balsis or ST_OUT
+    # 4. SPX F650 temporary redelivery postponement (dumyya pattern) must NOT be ST_FAILED / Gagal - Balsis -> ST_OUT
     payload_delay = {"retcode": 0, "data": {"sls_tracking_info": {"records": [
         {"display_flag": 1, "actual_time": 1764145080, "tracking_code": "F650", "milestone_code": 6,
          "milestone_name": "Out for delivery", "tracking_name": "Delivery Attempt Failed",
@@ -831,9 +831,9 @@ def test_spx_real_rts_completion_and_postponement_and_delivered():
     ]}}}
     with mock.patch.object(couriers._session, "get", return_value=FakeResp(payload_delay)):
         tr_delay = couriers.track_spx("SPXID_DELAY")
-    assert tr_delay.status == ST_TRANSIT
+    assert tr_delay.status == ST_OUT
     resolved_delay = resolve_overall_status("Sedang Dikirim", tr_delay.status, tr_delay.events)
-    assert resolved_delay == ST_TRANSIT
+    assert resolved_delay == ST_OUT
 
     # DB._migrate() heals pre-existing false-positive Gagal - Balsis rows with F650 redelivery events
     tmp_db = os.path.join(tempfile.mkdtemp(), "heal_rts.db")
@@ -844,7 +844,7 @@ def test_spx_real_rts_completion_and_postponement_and_delivered():
     )
     db.conn.commit()
     db._migrate()
-    assert db.get("SPXID_DELAY")["status"] == ST_TRANSIT
+    assert db.get("SPXID_DELAY")["status"] == ST_OUT
     db.close()
 
     # 5. SPX Delivered wording ("Pesanan tiba di alamat tujuan. diterima di Depan pintu.")
@@ -2333,6 +2333,103 @@ def test_db_cross_source_dedup_merge_and_multi_file_import():
         finally:
             cfg.DB_PATH, cfg.SETTINGS_PATH = old_cfg_db, old_cfg_set
             mw_mod.load_settings, mw_mod.save_settings = old_load, old_save
+
+
+def test_rejected_redelivery_vs_delivered_vs_returning_to_seller():
+    import json as _json
+    from resitrack.db import DB
+    from resitrack.models import CAT_FINISHED, classify, row_lifecycle
+    from resitrack.shopee_api import ShopeeClient
+
+    # 1. Rejected on attempt #1 but scheduled for redelivery -> ST_OUT ("Sedang Diantar")
+    rej_redeliv = [
+        TrackEvent("2026-11-27 09:02", "Pengiriman ditunda karena Pesanan ditolak pembeli. Pesanan akan dikirim ulang.", "Arso Hub"),
+        TrackEvent("2026-11-27 08:11", "Pesanan dalam proses pengantaran.", "Arso Hub"),
+    ]
+    assert classify(rej_redeliv[0].description) == ST_OUT
+    assert resolve_overall_status("Sedang Dikirim", "GAGAL", rej_redeliv) == ST_OUT
+    assert resolve_overall_status("Sedang Dikirim", ST_RTS_REJECTED, rej_redeliv) == ST_OUT
+
+    # Verify track_spx & ShopeeClient.tracking_info classify redelivery after rejection as ST_OUT
+    spx_payload = {"retcode": 0, "data": {"sls_tracking_info": {"records": [
+        {"display_flag": 1, "actual_time": 1795744920, "tracking_code": "F650", "milestone_code": 6,
+         "milestone_name": "Out for delivery", "tracking_name": "Delivery Attempt Failed",
+         "buyer_description": "Pengiriman ditunda karena Pesanan ditolak pembeli. Pesanan akan dikirim ulang.",
+         "current_location": {"location_name": "Arso Hub"}},
+    ]}}}
+    with mock.patch.object(couriers._session, "get", return_value=FakeResp(spx_payload)):
+        tr_spx = couriers.track_spx("SPXREJREDELIV")
+    assert tr_spx.status == ST_OUT
+
+    cl = ShopeeClient({
+        "shopee_partner_id": "123", "shopee_partner_key": "sec",
+        "shopee_shop_id": "1", "shopee_refresh_token": "rtok",
+    })
+    with mock.patch.object(cl, "get", return_value={
+        "logistics_status": "LOGISTICS_DELIVERY_FAILED",
+        "tracking_info": [
+            {"update_time": 1795744920, "description": "Pengiriman ditunda karena Pesanan ditolak pembeli. Pesanan akan dikirim ulang."},
+            {"update_time": 1795741860, "description": "Pesanan dalam proses pengantaran."},
+        ],
+    }):
+        tr_api = cl.tracking_info("SN_RED", "SPXREJREDELIV", "SPX")
+    assert tr_api.status == ST_OUT
+    assert resolve_overall_status("SHIPPED", tr_api.status, tr_api.events) == ST_OUT
+
+    # 2. Rejected on attempt #1, redelivered, and finally delivered to buyer -> ST_DELIVERED
+    rej_then_deliv = [
+        TrackEvent("2026-11-27 14:15", "Pesanan tiba di alamat tujuan. diterima oleh Yang bersangkutan.", "Arso Hub"),
+        TrackEvent("2026-11-27 11:00", "Pesanan dalam proses pengantaran.", "Arso Hub"),
+        TrackEvent("2026-11-27 09:02", "Pengiriman ditunda karena Pesanan ditolak pembeli. Pesanan akan dikirim ulang.", "Arso Hub"),
+        TrackEvent("2026-11-27 08:11", "Pesanan dalam proses pengantaran.", "Arso Hub"),
+    ]
+    assert resolve_overall_status("Telah Dikirim", ST_RTS_REJECTED, rej_then_deliv) == ST_DELIVERED
+    with mock.patch.object(cl, "get", return_value={
+        "logistics_status": "LOGISTICS_DELIVERY_FAILED",
+        "tracking_info": [{"update_time": 1795763700, "description": rej_then_deliv[0].description}]
+        + [{"update_time": 1795744920, "description": rej_then_deliv[2].description}],
+    }):
+        tr_api_del = cl.tracking_info("SN_DEL", "SPXREJDEL", "SPX")
+    assert tr_api_del.status == ST_DELIVERED
+    assert resolve_overall_status("TO_CONFIRM_RECEIVE", tr_api_del.status, tr_api_del.events) == ST_DELIVERED
+
+    # 3. Rejected by buyer AND returning to seller/sender -> ST_RTS_REJECTED ("Gagal - Ditolak")
+    returning_evs = [
+        TrackEvent("2026-11-27 14:31", "Pesanan telah dikirim dari lokasi sortir terakhir KCP ARSO 99368. untuk dikembalikan ke Pengirim.", "Arso Hub"),
+        TrackEvent("2026-11-27 12:57", "Pesanan gagal dikirim dan akan dikembalikan ke Pengirim.", "Arso Hub"),
+        TrackEvent("2026-11-27 09:02", "Pengiriman ditunda karena Pesanan ditolak pembeli. Pesanan akan dikirim ulang.", "Arso Hub"),
+        TrackEvent("2026-11-27 08:11", "Pesanan dalam proses pengantaran.", "Arso Hub"),
+    ]
+    assert resolve_overall_status("SHIPPED", ST_TRANSIT, returning_evs) == ST_RTS_REJECTED
+
+    # 4. Return completed (received by seller/sender) -> must NEVER be ST_DELIVERED, stays ST_RTS_REJECTED + Selesai
+    ret_done_evs = [
+        TrackEvent("2026-11-28 10:00", "Paket diterima kembali oleh penjual", "Pekalongan"),
+        TrackEvent("2026-11-27 12:57", "Pesanan gagal dikirim dan akan dikembalikan ke Pengirim.", "Arso Hub"),
+        TrackEvent("2026-11-27 08:11", "Pesanan dalam proses pengantaran.", "Arso Hub"),
+    ]
+    st_ret_done = resolve_overall_status("Batal", ST_DELIVERED, ret_done_evs)
+    assert st_ret_done == ST_RTS_REJECTED
+    assert row_lifecycle({"status": st_ret_done, "order_status": "Batal", "events_json": _json.dumps([e.__dict__ for e in ret_done_evs])}) == CAT_FINISHED
+
+    # 5. DB._migrate heals pre-existing false ST_RTS_REJECTED rows whose latest event is redelivery or delivered
+    with tempfile.TemporaryDirectory() as td:
+        db = DB(Path(td) / "heal_rej.db")
+        try:
+            db.conn.execute(
+                "INSERT INTO shipments (resi, courier, order_sn, status, order_status, events_json) VALUES (?, ?, ?, ?, ?, ?)",
+                ("SPX_HEAL_REDEL", "SPX", "SN_HR1", ST_RTS_REJECTED, "SHIPPED", _json.dumps([e.__dict__ for e in rej_redeliv])),
+            )
+            db.conn.execute(
+                "INSERT INTO shipments (resi, courier, order_sn, status, order_status, events_json) VALUES (?, ?, ?, ?, ?, ?)",
+                ("SPX_HEAL_DELIV", "SPX", "SN_HD1", ST_RTS_REJECTED, "SHIPPED", _json.dumps([e.__dict__ for e in rej_then_deliv])),
+            )
+            db.conn.commit()
+            db._migrate()
+            assert db.get("SPX_HEAL_REDEL")["status"] == ST_OUT
+            assert db.get("SPX_HEAL_DELIV")["status"] == ST_DELIVERED
+        finally:
+            db.close()
 
 
 if __name__ == "__main__":

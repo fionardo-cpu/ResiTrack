@@ -24,7 +24,8 @@ from typing import Callable
 import requests
 
 from .models import (ST_DELIVERED, ST_FAILED, ST_OUT, ST_PENDING, ST_RETURNED, ST_TRANSIT, ST_UNKNOWN,
-                     NotFound, TrackEvent, TrackingError, TrackResult, classify, is_delivered_event)
+                     NotFound, TrackEvent, TrackingError, TrackResult, classify, is_delivered_event,
+                     is_redelivery_event, is_rts_event)
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/124.0 Safari/537.36 ResiTrack/1.0")
@@ -137,12 +138,14 @@ def track_spx(resi: str) -> TrackResult:
         text = f"{latest.get('tracking_name', '')} {desc_low}".lower()
         code = (latest.get("tracking_code") or "").upper()
         if (
-            milestone_code == 10
-            or "unsuccessful" in milestone
-            or "dikembalikan ke" in desc_low
-            or "pengembalian pesanan" in desc_low
-            or "return" in text
-            or "retur" in text
+            (
+                milestone_code == 10
+                or "unsuccessful" in milestone
+                or is_rts_event(desc_low)
+                or "return" in text
+                or "retur" in text
+            )
+            and not is_redelivery_event(desc_low)
         ):
             res.status = ST_RETURNED
         elif (
@@ -151,16 +154,9 @@ def track_spx(resi: str) -> TrackResult:
             or is_delivered_event(desc_low)
         ):
             res.status = ST_DELIVERED
-        elif "ditolak pembeli" in desc_low or "akan dikembalikan" in desc_low:
-            res.status = ST_FAILED
-        elif (
-            code == "F650"
-            or "pengiriman ditunda" in desc_low
-            or "akan dikirim ulang" in desc_low
-            or "akan dilakukan kembali" in desc_low
-        ):
-            res.status = ST_TRANSIT
-        elif "fail" in text or "gagal" in text:
+        elif is_redelivery_event(desc_low) or code == "F650":
+            res.status = ST_OUT
+        elif "ditolak pembeli" in desc_low or "fail" in text or "gagal" in text:
             res.status = ST_FAILED
         elif code == "F600" or milestone_code == 6 or "dalam proses pengantaran" in desc_low:
             res.status = ST_OUT

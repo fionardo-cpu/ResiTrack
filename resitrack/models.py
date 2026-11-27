@@ -173,13 +173,26 @@ _DELIVERED_NEGATION_GUARD = (
     "gagal antar",
 )
 
+_RETURN_RECIPIENT_GUARD = (
+    "penjual",
+    "pengirim",
+    "seller",
+    "sender",
+    "dikembalikan",
+    "diterima kembali",
+    "return",
+    "retur",
+)
+
 
 def is_delivered_event(text: str) -> bool:
-    """Return True only when an event description indicates buyer/destination delivery (never drop-off/hub receipts)."""
+    """Return True only when an event description indicates buyer/destination delivery (never drop-off/hub/seller receipts)."""
     t = (text or "").strip().lower()
     if not t:
         return False
     if any(n in t for n in _DELIVERED_NEGATION_GUARD):
+        return False
+    if any(r in t for r in _RETURN_RECIPIENT_GUARD):
         return False
     if any(k in t for k in _STRONG_DELIVERED_KEYWORDS):
         return True
@@ -340,10 +353,45 @@ OUT_FOR_DELIVERY_KEYWORDS = (
 
 RTS_KEYWORDS = (
     "return to sender", "rts", "kembali ke penjual", "dikembalikan ke pengirim",
+    "dikembalikan ke penjual", "akan dikembalikan", "sedang dikembalikan", "untuk dikembalikan",
     "retur", "returning to seller", "returned to sender", "paket kembali",
     "kembali ke pengirim", "batal sistem", "dibatalkan sistem", "balsis",
     "pengembalian pesanan", "dikembalikan ke agen",
 )
+
+REDELIVERY_KEYWORDS = (
+    "akan dikirim ulang",
+    "pengiriman ulang",
+    "pengantaran ulang",
+    "akan diantar ulang",
+    "akan dilakukan kembali",
+    "dijadwalkan ulang",
+    "menjadwalkan ulang",
+    "percobaan pengantaran",
+    "redelivery",
+    "re-attempt",
+    "pengiriman ditunda",
+)
+
+_RTS_WORD_RE = re.compile(r"\brts\b")
+
+
+def is_rts_event(text: str) -> bool:
+    """Return True when tracking text explicitly indicates returning to seller/sender."""
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if _RTS_WORD_RE.search(t):
+        return True
+    return any(w in t for w in RTS_KEYWORDS if w != "rts")
+
+
+def is_redelivery_event(text: str) -> bool:
+    """Return True when delivery failed/postponed temporarily and courier is rescheduling/redelivering (not RTS)."""
+    t = (text or "").strip().lower()
+    if not t or is_rts_event(t):
+        return False
+    return any(k in t for k in REDELIVERY_KEYWORDS)
 
 FAILURE_KEYWORDS = (
     "gagal", "fail", "unsuccessful", "tidak berhasil", "bermasalah", "problem",
@@ -377,12 +425,14 @@ PRE_PICKUP_KEYWORDS = (
 def classify(text: str) -> str:
     """Guess a basic status from free text (ID/EN)."""
     t = (text or "").lower()
-    if any(w in t for w in RTS_KEYWORDS):
+    if is_rts_event(t):
         return "RTS"
-    if any(w in t for w in FAILURE_KEYWORDS):
-        return "GAGAL"
     if is_delivered_event(t):
         return ST_DELIVERED
+    if is_redelivery_event(t):
+        return ST_OUT
+    if any(w in t for w in FAILURE_KEYWORDS):
+        return "GAGAL"
     if any(w in t for w in OUT_FOR_DELIVERY_KEYWORDS):
         return ST_OUT
     if any(w in t for w in PRE_PICKUP_KEYWORDS):
@@ -437,20 +487,38 @@ def resolve_overall_status(
         event_texts.append(f"{desc} {loc}".strip())
 
     all_event_history_text = " ".join(event_texts)
+    latest_desc = event_descs[0] if event_descs else ""
 
-    # 2. Check for RTS (Return to Sender) / Failed Delivery
-    is_rts = (
-        trk_st in (ST_RTS_BALSIS, ST_RTS_REJECTED, ST_RTS_RETURN, "RTS", "Retur", "Gagal Antar", "GAGAL")
-        or any(w in all_event_history_text for w in RTS_KEYWORDS)
-        or any(w in ord_st for w in ("retur", "return", "pengembalian", "refund", "to_return"))
-    )
+    # 2. Check for formal Shopee return/refund request
+    if any(w in ord_st for w in ("pengembalian", "return", "refund", "to_return")):
+        return ST_RTS_RETURN
+    if any(w in all_event_history_text for w in ("retur barang pembeli", "pengembalian pembeli", "komplain retur")):
+        return ST_RTS_RETURN
+
+    # 2a. Buyer delivery always wins over earlier failed/redelivery/RTS attempts
+    if event_descs and is_delivered_event(latest_desc):
+        return ST_DELIVERED
+
+    # 2b. Check for RTS (Return to Sender), respecting chronology vs redelivery
+    rts_idx = next((i for i, ev in enumerate(event_texts) if is_rts_event(ev)), None)
+    if event_texts:
+        if rts_idx is not None:
+            has_newer_forward = any(
+                is_redelivery_event(event_descs[i])
+                or any(k in event_descs[i] for k in OUT_FOR_DELIVERY_KEYWORDS)
+                for i in range(rts_idx)
+            )
+            is_rts = not has_newer_forward
+        else:
+            is_rts = (
+                trk_st in (ST_RTS_BALSIS, ST_RTS_RETURN, "RTS", "Retur", "RETUR")
+                and not is_redelivery_event(latest_desc)
+                and not any(k in latest_desc for k in OUT_FOR_DELIVERY_KEYWORDS)
+            )
+    else:
+        is_rts = trk_st in (ST_RTS_BALSIS, ST_RTS_REJECTED, ST_RTS_RETURN, "RTS", "Retur", "RETUR", "Gagal Antar", "GAGAL")
 
     if is_rts:
-        # Check if it is a formal buyer return/refund request
-        if any(w in ord_st for w in ("pengembalian", "return", "refund", "to_return")):
-            return ST_RTS_RETURN
-        if any(w in all_event_history_text for w in ("retur barang pembeli", "pengembalian pembeli", "komplain retur")):
-            return ST_RTS_RETURN
         if not event_texts and trk_st in (ST_RTS_RETURN, ST_RTS_REJECTED, ST_RTS_BALSIS):
             return trk_st
 
@@ -512,9 +580,10 @@ def resolve_overall_status(
         # Delivered to buyer, but Shopee order status is not yet "Selesai" (dana belum cair)
         return ST_DELIVERED
 
-    if trk_st == ST_OUT or any(
-        any(k in ev for k in OUT_FOR_DELIVERY_KEYWORDS)
-        for ev in event_descs[:1]
+    if (
+        trk_st == ST_OUT
+        or is_redelivery_event(latest_desc)
+        or any(k in latest_desc for k in OUT_FOR_DELIVERY_KEYWORDS)
     ):
         return ST_OUT
 

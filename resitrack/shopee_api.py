@@ -23,8 +23,9 @@ from urllib.parse import parse_qs, urlencode, urlparse
 import requests
 
 from .couriers import detect_courier, normalize_resi
-from .models import (ST_DELIVERED, ST_FAILED, ST_OUT, ST_PENDING, ST_RETURNED, ST_TRANSIT, TrackEvent,
-                     TrackingError, TrackResult, infer_date_from_order_sn, is_masked_blank,
+from .models import (OUT_FOR_DELIVERY_KEYWORDS, ST_DELIVERED, ST_FAILED, ST_OUT, ST_PENDING, ST_RETURNED,
+                     ST_TRANSIT, TrackEvent, TrackingError, TrackResult, infer_date_from_order_sn,
+                     is_delivered_event, is_masked_blank, is_redelivery_event, is_rts_event,
                      merge_products, parse_idr)
 
 HOST_LIVE = "https://partner.shopeemobile.com"
@@ -282,7 +283,13 @@ class ShopeeClient:
         if res.events:
             res.last_event, res.last_time = res.events[0].description, res.events[0].time
             low = res.last_event.lower()
-            if res.status == ST_TRANSIT and any(k in low for k in ("diantar", "dalam proses pengantaran", "out for delivery")):
+            if is_delivered_event(low):
+                res.status = ST_DELIVERED
+            elif is_redelivery_event(low):
+                res.status = ST_OUT
+            elif res.status == ST_FAILED and not any(is_rts_event(e.description) for e in res.events):
+                res.status = ST_OUT if any(k in low for k in OUT_FOR_DELIVERY_KEYWORDS) else ST_TRANSIT
+            elif res.status == ST_TRANSIT and any(k in low for k in OUT_FOR_DELIVERY_KEYWORDS):
                 res.status = ST_OUT
         return res
 
